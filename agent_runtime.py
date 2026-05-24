@@ -20,7 +20,7 @@ MAX_TOKENS_PER_JOB = 50_000  # Aggregate over all turns (response.usage.total_to
 MAX_FILES_WRITTEN = 20  # Hard cap on file_write tool successes per job.
 DEFAULT_TIMEOUT_S = 300  # 5 minutes wall-time.
 DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024  # 4 MB per tool result.
-DEFAULT_SWARMSYNC_MODEL = os.getenv("DEFAULT_SWARMSYNC_MODEL", "openai/gpt-5-mini")
+DEFAULT_SWARMSYNC_MODEL = "minimax/minimax-m2.5"
 OPENROUTER_HOST_MARKERS = ("openrouter.ai",)
 
 
@@ -453,7 +453,7 @@ class AgentRuntime:
         # "auto" is a valid SwarmSync router alias — pass it through so the router
         # runs complexity scoring and selects the best model/tier. Do NOT replace it
         # with a hardcoded model string here; doing so disables smart routing entirely.
-        model_candidates = [primary or model, "openai/gpt-5-mini", "openai/gpt-5.1"]
+        model_candidates = [primary or model, "openrouter/free", "minimax/minimax-m2.5:free"]
         deduped: list[str] = []
         for m in model_candidates:
             if m and m not in deduped:
@@ -488,4 +488,8 @@ class AgentRuntime:
                         log.warning(
                             "LLM call failed status=%s model=%s; trying next model",
                             resp.status,
-               
+                            routed_model,
+                        )
+                        continue
+                    raise RuntimeError(last_error)
+        raise RuntimeError(last_error)
