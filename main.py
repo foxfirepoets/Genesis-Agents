@@ -2837,3 +2837,7 @@ async def verify_proof(proof_id: str):
                 "output_hash": row["outputHash"],
                 "conduit_session_id": row["conduitSessionId"],
             }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"database error: {exc}") from exc
