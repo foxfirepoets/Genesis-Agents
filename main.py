@@ -708,6 +708,7 @@ X402_STUB_MARKER = "x402 HTTP service"
 ROUTER_FALLBACK_MODELS = [
     PERSONA_PRIMARY_MODEL,
     "openai/gpt-5-mini",
+    "openai/gpt-5.1",
 ]
 
 
@@ -907,6 +908,15 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
                     status_code=502,
                     detail=f"LLM router returned empty content for model={model_id}",
                 )
+                if attempt < len(backoffs):
+                    logger.warning(
+                        "LLM router returned empty content for model=%s attempt %d; sleeping %.1fs",
+                        model_id,
+                        attempt + 1,
+                        backoffs[attempt],
+                    )
+                    await asyncio.sleep(backoffs[attempt])
+                    continue
                 logger.warning("LLM router returned empty content for model=%s; trying next model", model_id)
                 break
 
