@@ -848,7 +848,7 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
 
     for model_id in models:
         for attempt, _ in enumerate([()] * (len(backoffs) + 1)):
-            async with httpx.AsyncClient(timeout=75.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
                     url,
                     headers={
@@ -863,7 +863,7 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
                         ],
-                        "max_tokens": 1200,
+                        "max_tokens": 2048,
                     },
                 )
 
