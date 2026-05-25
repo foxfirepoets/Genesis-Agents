@@ -1600,6 +1600,11 @@ async def run_agent(slug: str, body: RunRequest):
 
     response_text, swarmsync_meta = _router_result_payload(router_result)
     payload: dict[str, Any] = {"ok": True, "response": response_text}
+    if isinstance(router_result, dict):
+        if router_result.get("usage") is not None:
+            payload["usage"] = router_result.get("usage")
+        if router_result.get("model") is not None:
+            payload["model"] = router_result.get("model")
     if swarmsync_meta:
         payload["swarmsync"] = swarmsync_meta
         routed = swarmsync_meta.get("routed_model") or ""
