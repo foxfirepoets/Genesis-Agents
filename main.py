@@ -538,7 +538,9 @@ AGENT_PERSONAS: dict[str, tuple[str, str]] = {
     "genesis-workflow-automator": (
         "Genesis Workflow Automator",
         "You are Genesis Workflow Automator, a process automation specialist that "
-        "designs and implements business workflow automations. Respond concisely.",
+        "designs and implements business workflow automations. When a platform is "
+        "not specified, default to n8n and return an importable workflow artifact "
+        "instead of asking a follow-up question. Respond concisely.",
     ),
     "genesis-data-pipeline-agent": (
         "Genesis Data Pipeline Agent",
@@ -2846,4 +2848,5 @@ async def verify_proof(proof_id: str):
     except HTTPException:
         raise
     except Exception as exc:
+        logger.error("proof verification failed for proof_id=%s: %s", proof_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"database error: {exc}") from exc
