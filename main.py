@@ -2405,6 +2405,12 @@ async def agent_card() -> dict[str, Any]:
     return COMMERCE_DEMO_AGENT_CARD
 
 
+@app.get("/a2a/health")
+async def a2a_health() -> dict[str, Any]:
+    """A2A health probe — some registries and crawlers check /a2a/health."""
+    return {"status": "ok", "service": COMMERCE_DEMO_AGENT_CARD["name"]}
+
+
 @app.get("/a2a")
 async def a2a_discovery() -> dict[str, Any]:
     """
