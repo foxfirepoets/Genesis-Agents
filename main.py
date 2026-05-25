@@ -700,15 +700,14 @@ _openrouter_api_key = _llm_api_key
 # Legacy persona path model. Bundle-backed Genesis agents use AgentRuntime's
 # SwarmSync model default instead.
 FREE_MODEL = os.getenv("LEGACY_PERSONA_MODEL", "minimax/minimax-m2.5")
-PERSONA_ROUTER_MODEL = os.getenv("GENESIS_LLM_MODEL", "auto")
+PERSONA_ROUTER_MODEL = os.getenv("GENESIS_LLM_MODEL", "openai/gpt-5-mini").strip()
+PERSONA_PRIMARY_MODEL = (
+    "openai/gpt-5-mini" if PERSONA_ROUTER_MODEL.lower() == "auto" else PERSONA_ROUTER_MODEL
+)
 X402_STUB_MARKER = "x402 HTTP service"
 ROUTER_FALLBACK_MODELS = [
-    PERSONA_ROUTER_MODEL,
-    "auto",
+    PERSONA_PRIMARY_MODEL,
     "openai/gpt-5-mini",
-    FREE_MODEL,
-    "openrouter/free",
-    "minimax/minimax-m2.5:free",
 ]
 
 
@@ -843,13 +842,13 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
         )
     url = _llm_api_url()
 
-    backoffs = [5.0, 15.0]
+    backoffs = [2.0]
     last_exc: HTTPException | None = None
     models = list(dict.fromkeys(m for m in ROUTER_FALLBACK_MODELS if m))
 
     for model_id in models:
         for attempt, _ in enumerate([()] * (len(backoffs) + 1)):
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=75.0) as client:
                 resp = await client.post(
                     url,
                     headers={
@@ -864,7 +863,7 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
                         ],
-                        "max_tokens": 2048,
+                        "max_tokens": 1200,
                     },
                 )
 
