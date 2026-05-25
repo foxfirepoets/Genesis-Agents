@@ -700,8 +700,12 @@ _openrouter_api_key = _llm_api_key
 # Legacy persona path model. Bundle-backed Genesis agents use AgentRuntime's
 # SwarmSync model default instead.
 FREE_MODEL = os.getenv("LEGACY_PERSONA_MODEL", "minimax/minimax-m2.5")
+PERSONA_ROUTER_MODEL = os.getenv("GENESIS_LLM_MODEL", "auto")
 X402_STUB_MARKER = "x402 HTTP service"
 ROUTER_FALLBACK_MODELS = [
+    PERSONA_ROUTER_MODEL,
+    "auto",
+    "openai/gpt-5-mini",
     FREE_MODEL,
     "openrouter/free",
     "minimax/minimax-m2.5:free",
@@ -841,7 +845,7 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
 
     backoffs = [5.0, 15.0]
     last_exc: HTTPException | None = None
-    models = [m for m in ROUTER_FALLBACK_MODELS if m]
+    models = list(dict.fromkeys(m for m in ROUTER_FALLBACK_MODELS if m))
 
     for model_id in models:
         for attempt, _ in enumerate([()] * (len(backoffs) + 1)):
@@ -898,9 +902,18 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
                 )
 
             data = resp.json()
+            content = str(data.get("choices", [{}])[0].get("message", {}).get("content") or "")
+            if not content.strip():
+                last_exc = HTTPException(
+                    status_code=502,
+                    detail=f"LLM router returned empty content for model={model_id}",
+                )
+                logger.warning("LLM router returned empty content for model=%s; trying next model", model_id)
+                break
+
             swarmsync = data.get("swarmsync") if isinstance(data.get("swarmsync"), dict) else None
             return {
-                "text": data["choices"][0]["message"]["content"],
+                "text": content,
                 "swarmsync": swarmsync,
                 "usage": data.get("usage"),
                 "model": data.get("model"),
@@ -1572,28 +1585,9 @@ async def run_agent(slug: str, body: RunRequest):
                 )
 
     # ------------------------------------------------------------------
-    # 2) Fallback: router persona + Gemini safety net
+    # 2) Fallback: router persona. Agent runs must stay on SwarmSync Routing.
     # ------------------------------------------------------------------
-    try:
-        router_result = await call_llm_router(system_prompt, user_prompt)
-    except HTTPException as e:
-        if e.status_code in (429, 502) and GEMINI_API_KEY:
-            logger.warning(
-                "LLM router failed for slug=%s (%s) — falling back to Gemini Flash Lite",
-                slug,
-                e.status_code,
-            )
-            response_text = await call_gemini_fallback(system_prompt, user_prompt)
-            router_result = {
-                "text": response_text,
-                "swarmsync": {
-                    "routing_reason": "gemini_fallback",
-                    "routed_model": GEMINI_FALLBACK_MODEL,
-                    "tier": "economy",
-                },
-            }
-        else:
-            raise
+    router_result = await call_llm_router(system_prompt, user_prompt)
 
     response_text, swarmsync_meta = _router_result_payload(router_result)
     payload: dict[str, Any] = {"ok": True, "response": response_text}
