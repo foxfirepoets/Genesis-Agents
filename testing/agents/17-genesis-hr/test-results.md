@@ -10,10 +10,10 @@
 ## Slug Discrepancy Test
 | Endpoint | HTTP Status | Result |
 |----------|-------------|--------|
-| `/agents/onboarding_agent/run` | 200 OK | Returns inner slug `genesis-onboarding` |
+| `/agents/onboarding_agent/run` | 200 OK | Returns inner slug `genesis-hr` |
 | `/agents/genesis_hr_x402/run` | **200 OK** | Returns inner slug `genesis-hr` |
 
-**Finding:** Both endpoints work via aliasing. However, they return **different inner slugs** — `genesis-onboarding` vs `genesis-hr`. These may be two different agent bundles mapped to the same endpoint aliases, causing inconsistent behavior depending on which slug is used.
+**Finding:** Both endpoints work via aliasing and resolve to the same canonical bundle: `genesis-hr`.
 
 ## Routing Metadata
 | Field | Value |
@@ -34,7 +34,7 @@ Yes — onboarding checklist for new AI agent vendor:
 ## Issues
 | Severity | Issue |
 |----------|-------|
-| Medium | Slug discrepancy AND different inner slugs returned (genesis-onboarding vs genesis-hr) — two different bundles? |
+| Resolved | Slug aliases now resolve to the same inner slug (`genesis-hr`) |
 | Medium | Agent self-identified as "ChatGPT" in one run (non-deterministic identity) |
 | Low | Identity non-deterministic — some runs say "Genesis onboarding agent", others say "ChatGPT" |
 
@@ -43,4 +43,4 @@ Yes — onboarding checklist for new AI agent vendor:
 - **Routing score: 5/5**
 
 ## Verdict
-**PARTIALLY FUNCTIONAL** (inner slug inconsistency indicates possible bundle mapping issue)
+**FUNCTIONAL** (alias routes resolve to one canonical HR bundle)

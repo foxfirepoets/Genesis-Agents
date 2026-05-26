@@ -20,7 +20,7 @@ MAX_TOKENS_PER_JOB = 50_000  # Aggregate over all turns (response.usage.total_to
 MAX_FILES_WRITTEN = 20  # Hard cap on file_write tool successes per job.
 DEFAULT_TIMEOUT_S = 300  # 5 minutes wall-time.
 DEFAULT_MAX_OUTPUT_BYTES = 4 * 1024 * 1024  # 4 MB per tool result.
-DEFAULT_SWARMSYNC_MODEL = "minimax/minimax-m2.5"
+DEFAULT_SWARMSYNC_MODEL = "auto"
 OPENROUTER_HOST_MARKERS = ("openrouter.ai",)
 
 

@@ -19,3 +19,6 @@ venv/
 .venv/
 chromium/
 patchright/
+
+# Local Codex session context injected by the desktop app
+AGENTS.md

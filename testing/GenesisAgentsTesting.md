@@ -12,7 +12,7 @@ Tested all 20 Genesis agents live against their Render endpoints. **14 are fully
 
 The 5 non-functional agents share a single root cause: **the ConduitBridge (Patchright browser) startup path exceeds Render's 30-second proxy timeout**, triggered by agents whose skill bundles include `conduit` in `tools_advertised`. One line of code in `main.py` unblocks 4 of the 5. The 5th (Finance) has a persona scope problem requiring a system prompt update.
 
-The routing layer works. All live agents route through `https://api.swarmsync.ai/v1/chat/completions`. Full routing metadata (model, provider, tier, cost, tokens, quality gate) is surfaced in responses. However, **smart tier selection is disabled** — all agents use `direct_model_request` to `openai/gpt-5-mini` regardless of task complexity, wasting the SwarmSync router's intelligence.
+The routing layer works. All live agents route through `https://api.swarmsync.ai/v1/chat/completions`. `GENESIS_LLM_MODEL=auto` is now the default so the gateway passes requests through SwarmSync complexity scoring instead of forcing a direct model request.
 
 ---
 
@@ -36,7 +36,7 @@ The routing layer works. All live agents route through `https://api.swarmsync.ai
 | 14 | Genesis Marketing Agent | `/agents/genesis_marketing_x402/run` | 200 | 5/5 | 4/5 | ✅ LIVE AND FUNCTIONAL |
 | 15 | Genesis SEO Agent | `/agents/genesis_seo_x402/run` | 200 | 5/5 | 5/5 | ✅ LIVE AND FUNCTIONAL |
 | 16 | Genesis Legal Agent | `/agents/legal_agent/run` ⚠️ slug | 200 | 5/5 | 5/5 | ✅ LIVE AND FUNCTIONAL |
-| 17 | Genesis HR Agent | `/agents/onboarding_agent/run` ⚠️ slug | 200 | 4/5 | 5/5 | ⚠️ PARTIALLY FUNCTIONAL |
+| 17 | Genesis HR Agent | `/agents/onboarding_agent/run` | 200 | 4/5 | 5/5 | ✅ FUNCTIONAL |
 | 18 | Genesis Data Pipeline | `/agents/genesis-data-pipeline-agent/run` ⚠️ slug | 200 | 5/5 | 5/5 | ✅ LIVE AND FUNCTIONAL |
 | 19 | Genesis Workflow Automator | `/agents/genesis-workflow-automator/run` | 200 | 5/5 | 5/5 | ✅ LIVE AND FUNCTIONAL |
 | 20 | Genesis AI Vision API | `/agents/genesis-ai-vision-api/run` | 200 | 5/5 | 5/5 | ✅ LIVE AND FUNCTIONAL |
@@ -102,9 +102,9 @@ Confirmed by both code review (`agent_runtime.py`, `main.py`) and by live respon
 
 ### Routing Gap: Smart Tier Selection Disabled
 
-`complexity_score: -1` and `routing_reason: direct_model_request` on every agent — the SwarmSync router's intelligence (complexity scoring, economy/mid/premium tier selection) is fully bypassed. The gateway hardcodes a specific model via `GENESIS_LLM_MODEL` env var instead of `"auto"`.
+`GENESIS_LLM_MODEL=auto` is the gateway default. The SwarmSync router receives `model: "auto"` and can select economy/mid/premium tiers using task complexity.
 
-Fix: Set `GENESIS_LLM_MODEL=auto` in agents-gateway Render environment.
+Fix: Keep `GENESIS_LLM_MODEL=auto` in agents-gateway Render environment.
 
 ### Known Routing Bypass
 
@@ -236,7 +236,7 @@ Plain-English ToS risk checklist covering IP ownership, liability limits, paymen
 ### Agent 17 — Genesis HR Agent ⚠️ PARTIALLY FUNCTIONAL
 Marketplace: `genesis_hr_x402` | Gateway: `onboarding_agent` | Both: 200 via aliasing
 
-Both routes work but return different inner slugs (`genesis-onboarding` vs `genesis-hr`) — two different bundles may be mapped to the same aliases. Task executed but identity non-deterministic ("ChatGPT" in some runs).
+Both routes work and resolve to the same inner slug (`genesis-hr`).
 
 ### Agent 18 — Genesis Data Pipeline Agent ✅ (slug discrepancy resolved)
 Marketplace: `genesis-data-pipeline` | Gateway: `genesis-data-pipeline-agent` | Both: 200 via aliasing
@@ -286,9 +286,9 @@ Vision API spec: input formats (JPEG/PNG/WEBP/GIF, 10MB, 4096×4096), response s
 ## Top 5 Immediate Actions
 
 1. **1 line in `main.py` ~1339** — change `bundle_slug == "genesis-meta"` check to apply to all. Unblocks agents 02-05 immediately.
-2. **Set `GENESIS_LLM_MODEL=auto`** in Render env for agents-gateway — activates smart routing.
+2. **Keep `GENESIS_LLM_MODEL=auto`** in Render env for agents-gateway — activates smart routing.
 3. **Update Finance Agent (10) system prompt** — include analytical finance tasks (revenue modeling, unit economics).
-4. **Audit HR Agent (17) bundle mapping** — resolve inner slug inconsistency (genesis-onboarding vs genesis-hr).
+4. **HR Agent (17) bundle mapping** — resolved: `onboarding_agent` and `genesis_hr_x402` both map to `genesis-hr`.
 5. **Fix quality gate regex** — exclude `{{...}}` template tokens from `proof_validation_failure` heuristic.
 
 ---

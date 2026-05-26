@@ -7,10 +7,17 @@ Each agent is accessible at:  POST /agents/{slug}/run
   Body: { "prompt": "...", "testContext": true }
   Response: { "response": "..." }
 
+Conduit-heavy agents declare `job_mode: "async"`. Real `/run` requests for
+those bundles return a queued `{job_id, poll_url}` payload immediately so
+Render's request proxy is never held open while browser automation starts.
+
 In testContext mode the gateway routes LLM calls through SwarmSync's routing
 layer with a persona system prompt matching the agent. For real traffic, the
 gateway can be extended to invoke the actual agent logic (x402 payment, Azure
 AI, etc.).
+
+GENESIS_LLM_MODEL defaults to `auto`, which is passed through to the SwarmSync
+router so it can run complexity scoring and choose the appropriate model tier.
 
 Environment variables:
   LLM_API_KEY         - required for testContext responses routed through SwarmSync
@@ -222,20 +229,20 @@ async def verify_gateway_key(
     raise HTTPException(status_code=401, detail="Invalid or missing X-Agent-Api-Key")
 
 
-_ADMIN_EMAILS_RAW = os.getenv("SWARMSYNC_ADMIN_EMAILS", "")
+_DEFAULT_ADMIN_EMAILS = "bullrushinvestments@gmail.com"
+_ADMIN_EMAILS_RAW = os.getenv("SWARMSYNC_ADMIN_EMAILS", _DEFAULT_ADMIN_EMAILS)
 ADMIN_EMAILS = [e.strip().lower() for e in _ADMIN_EMAILS_RAW.split(",") if e.strip()]
 if not ADMIN_EMAILS:
     logger.warning(
-        "SWARMSYNC_ADMIN_EMAILS is not set — all /admin/* endpoints will return 503"
+        "SWARMSYNC_ADMIN_EMAILS is empty — all /admin/* endpoints will return 503"
     )
 
 
 async def require_admin(x_admin_email: str = Header(default="", alias="x-admin-email")) -> None:
     """Header-based admin gate for /admin/* endpoints.
 
-    Requires SWARMSYNC_ADMIN_EMAILS env var (comma-separated emails).
-    If the env var is not configured the endpoint returns 503 rather than
-    failing open to a hardcoded default identity.
+    Uses SWARMSYNC_ADMIN_EMAILS env var (comma-separated emails), defaulting
+    to bullrushinvestments@gmail.com when the env var is not configured.
     """
     if not ADMIN_EMAILS:
         raise HTTPException(status_code=503, detail="Admin auth not configured")
@@ -700,10 +707,8 @@ _openrouter_api_key = _llm_api_key
 # Legacy persona path model. Bundle-backed Genesis agents use AgentRuntime's
 # SwarmSync model default instead.
 FREE_MODEL = os.getenv("LEGACY_PERSONA_MODEL", "minimax/minimax-m2.5")
-PERSONA_ROUTER_MODEL = os.getenv("GENESIS_LLM_MODEL", "openai/gpt-5-mini").strip()
-PERSONA_PRIMARY_MODEL = (
-    "openai/gpt-5-mini" if PERSONA_ROUTER_MODEL.lower() == "auto" else PERSONA_ROUTER_MODEL
-)
+PERSONA_ROUTER_MODEL = os.getenv("GENESIS_LLM_MODEL", "auto").strip()
+PERSONA_PRIMARY_MODEL = PERSONA_ROUTER_MODEL
 X402_STUB_MARKER = "x402 HTTP service"
 ROUTER_FALLBACK_MODELS = [
     PERSONA_PRIMARY_MODEL,
@@ -1017,12 +1022,18 @@ _verification_jobs: dict[str, dict[str, Any]] = {}
 _arbitrage_verification_jobs: dict[str, dict[str, Any]] = {}
 
 
+def _internal_secret() -> str:
+    """Return the current internal callback secret from the environment."""
+    return os.getenv("INTERNAL_SECRET", "")
+
+
 def _require_internal_secret(x_internal_secret: str | None) -> None:
     """Raise 401 if the X-Internal-Secret header is missing or wrong."""
-    if not INTERNAL_SECRET:
+    expected_secret = _internal_secret()
+    if not expected_secret:
         # If not configured, reject all calls — prevents open endpoints in production
         raise HTTPException(status_code=503, detail="INTERNAL_SECRET not configured on this service")
-    if x_internal_secret != INTERNAL_SECRET:
+    if x_internal_secret != expected_secret:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Internal-Secret")
 
 
@@ -1073,7 +1084,7 @@ async def _run_and_callback(
                 json=callback_body,
                 headers={
                     "Content-Type": "application/json",
-                    "X-Internal-Secret": INTERNAL_SECRET,
+                    "X-Internal-Secret": _internal_secret(),
                 },
             )
             if resp.status_code not in (200, 201):
@@ -1105,7 +1116,7 @@ async def _run_and_callback(
                     },
                     headers={
                         "Content-Type": "application/json",
-                        "X-Internal-Secret": INTERNAL_SECRET,
+                        "X-Internal-Secret": _internal_secret(),
                     },
                 )
         except Exception:
@@ -1234,7 +1245,7 @@ async def _run_arbitrage_verification_and_callback(
                 json=callback_body.model_dump(),
                 headers={
                     "Content-Type": "application/json",
-                    "X-Internal-Secret": INTERNAL_SECRET,
+                    "X-Internal-Secret": _internal_secret(),
                 },
             )
             if resp.status_code not in (200, 201):
@@ -1273,7 +1284,7 @@ async def _run_arbitrage_verification_and_callback(
                     json=failed_body.model_dump(),
                     headers={
                         "Content-Type": "application/json",
-                        "X-Internal-Secret": INTERNAL_SECRET,
+                        "X-Internal-Secret": _internal_secret(),
                     },
                 )
         except Exception:
@@ -1321,6 +1332,7 @@ async def run_agent(slug: str, body: RunRequest):
         bundle_slug = resolve_bundle_slug(slug)
     except Exception:
         bundle_slug = slug
+    skip_loaded_agent = False
 
     # External-escrow mode: when the marketplace (or any external coordinator)
     # is the escrow owner, the gateway must skip its OWN escrow init / complete /
@@ -1368,12 +1380,17 @@ async def run_agent(slug: str, body: RunRequest):
                     "run_agent slug=%s live_test/testContext — bypassing AgentRuntime, using persona router",
                     slug,
                 )
+                display_name = str(bundle_name)
+                system_prompt = str(bundle.get("system_prompt") or system_prompt)
+                skip_loaded_agent = True
                 bundle = None
 
         if bundle is not None:
-            # Phase 4 — async / long-running orchestrators (e.g. genesis-meta,
-            # genesis-research) get persisted via job_store.create_job and a
-            # job_id is returned immediately. The worker picks it up.
+            # Phase 4 — async / long-running orchestrators and conduit-heavy
+            # agents (Builder, Deploy, QA, Research, Meta) get persisted via
+            # job_store.create_job and a job_id is returned immediately. The
+            # worker picks it up, keeping Render's proxy out of the browser
+            # startup path.
             if bundle.get("job_mode") == "async" and not _prefer_sync_bundle_run(body):
                 if not _JOB_STORE_OK or create_job is None:
                     raise HTTPException(status_code=503, detail="job_store_unavailable")
@@ -1446,6 +1463,7 @@ async def run_agent(slug: str, body: RunRequest):
 
                 queued_payload = {
                     "status": job.get("status", "QUEUED"),
+                    "slug": bundle.get("slug", bundle_slug),
                     "job_id": job["id"],
                     "poll_url": f"/agents/jobs/{job['id']}",
                     "idempotent_hit": job.get("idempotent_hit", False),
@@ -1564,7 +1582,7 @@ async def run_agent(slug: str, body: RunRequest):
     # ------------------------------------------------------------------
     # 1) Try real Python agent via loader (best-effort, never crashes)
     # ------------------------------------------------------------------
-    if load_agent is not None:
+    if load_agent is not None and not skip_loaded_agent:
         try:
             agent = load_agent(slug)
         except Exception as exc:  # pragma: no cover - ultra-defensive
@@ -1599,7 +1617,7 @@ async def run_agent(slug: str, body: RunRequest):
     router_result = await call_llm_router(system_prompt, user_prompt)
 
     response_text, swarmsync_meta = _router_result_payload(router_result)
-    payload: dict[str, Any] = {"ok": True, "response": response_text}
+    payload: dict[str, Any] = {"ok": True, "slug": bundle_slug, "response": response_text}
     if isinstance(router_result, dict):
         if router_result.get("usage") is not None:
             payload["usage"] = router_result.get("usage")

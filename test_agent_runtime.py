@@ -28,6 +28,9 @@ def test_resolve_bundle_slug_x402_and_aliases():
     assert resolve_bundle_slug("genesis_builder_x402") == "genesis-builder"
     assert resolve_bundle_slug("genesis_legal_x402") == "genesis-legal"
     assert resolve_bundle_slug("legal_agent") == "genesis-legal"
+    assert resolve_bundle_slug("onboarding_agent") == "genesis-hr"
+    assert resolve_bundle_slug("genesis_hr_x402") == "genesis-hr"
+    assert load_bundle("onboarding_agent")["slug"] == load_bundle("genesis_hr_x402")["slug"] == "genesis-hr"
     assert resolve_bundle_slug("genesis_meta_agent") == "genesis-meta"
     assert load_bundle("genesis_qa_x402") is not None
 
@@ -40,7 +43,7 @@ async def test_runtime_unknown_slug():
     assert result["error"] == "unknown_slug"
 
 
-def test_swarmsync_router_uses_concrete_model_by_default(monkeypatch):
+def test_swarmsync_router_uses_auto_model_by_default(monkeypatch):
     rt = AgentRuntime(llm_url="https://api.swarmsync.ai/v1/chat/completions", llm_key="fake")
 
     captured = {}
@@ -88,10 +91,10 @@ def test_swarmsync_router_uses_concrete_model_by_default(monkeypatch):
     asyncio.run(rt._call_llm("anthropic/claude-sonnet-4-5", [{"role": "user", "content": "x"}], [], 100))
 
     assert captured["url"] == "https://api.swarmsync.ai/v1/chat/completions"
-    assert captured["json"]["model"] == "minimax/minimax-m2.5"
+    assert captured["json"]["model"] == "auto"
 
 
-def test_swarmsync_router_rewrites_auto_model_to_concrete_default(monkeypatch):
+def test_swarmsync_router_passes_auto_model_through(monkeypatch):
     rt = AgentRuntime(llm_url="https://api.swarmsync.ai/v1/chat/completions", llm_key="fake")
 
     captured = {}
@@ -130,6 +133,54 @@ def test_swarmsync_router_rewrites_auto_model_to_concrete_default(monkeypatch):
     import asyncio
 
     monkeypatch.setenv("GENESIS_LLM_MODEL", "auto")
+    monkeypatch.delenv("GENESIS_ALLOW_OPENROUTER_FALLBACK", raising=False)
+    monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
+    monkeypatch.setattr(aiohttp, "ClientTimeout", FakeClientTimeout)
+
+    asyncio.run(rt._call_llm("anthropic/claude-sonnet-4-5", [{"role": "user", "content": "x"}], [], 100))
+
+    assert captured["json"]["model"] == "auto"
+
+
+def test_swarmsync_router_passes_concrete_model_through(monkeypatch):
+    rt = AgentRuntime(llm_url="https://api.swarmsync.ai/v1/chat/completions", llm_key="fake")
+
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeSession:
+        def __init__(self, timeout):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, headers, json):
+            captured["json"] = json
+            return FakeResponse()
+
+    class FakeClientTimeout:
+        def __init__(self, total):
+            self.total = total
+
+    import aiohttp
+    import asyncio
+
+    monkeypatch.setenv("GENESIS_LLM_MODEL", "minimax/minimax-m2.5")
     monkeypatch.delenv("GENESIS_ALLOW_OPENROUTER_FALLBACK", raising=False)
     monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
     monkeypatch.setattr(aiohttp, "ClientTimeout", FakeClientTimeout)

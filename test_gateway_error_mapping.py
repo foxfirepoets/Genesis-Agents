@@ -1,6 +1,10 @@
 from fastapi import HTTPException
 
-from main import _llm_api_key, _llm_api_url, _raise_for_runtime_failure
+import json
+
+import pytest
+
+from main import RunRequest, _llm_api_key, _llm_api_url, _raise_for_runtime_failure, run_agent
 
 
 def test_runtime_failure_raises_non_200_status():
@@ -50,3 +54,68 @@ def test_openrouter_key_requires_explicit_fallback_flag(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
 
     assert _llm_api_key() == "sk-or-test"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_slug", "expected_agent_name"),
+    [
+        ("genesis_builder_x402", "Genesis Builder Agent"),
+        ("genesis_deploy_x402", "Genesis Deploy Agent"),
+        ("genesis_qa_x402", "Genesis QA Agent"),
+    ],
+)
+async def test_conduit_heavy_run_requests_enqueue_async_jobs(monkeypatch, request_slug, expected_agent_name):
+    import main
+
+    def fake_create_job(**kwargs):
+        return {
+            "id": "cqueued123",
+            "status": "QUEUED",
+            "created_at": "2026-05-26T00:00:00+00:00",
+            "idempotent_hit": False,
+        }
+
+    def fail_get_runtime():
+        raise AssertionError("async bundles must not execute AgentRuntime during /run")
+
+    monkeypatch.setattr(main, "_JOB_STORE_OK", True)
+    monkeypatch.setattr(main, "create_job", fake_create_job)
+    monkeypatch.setattr(main, "_get_runtime", fail_get_runtime)
+
+    result = await run_agent(
+        request_slug,
+        RunRequest(prompt="Perform a real browser-heavy task", task={"scope": "smoke"}),
+    )
+
+    payload = json.loads(result.response)
+    assert result.agentName == expected_agent_name
+    assert payload["slug"] == request_slug.replace("_x402", "").replace("_", "-")
+    assert payload["job_id"] == "cqueued123"
+    assert payload["status"] == "QUEUED"
+    assert payload["poll_url"] == "/agents/jobs/cqueued123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_slug", ["onboarding_agent", "genesis_hr_x402"])
+async def test_hr_aliases_use_same_canonical_bundle_in_live_test(monkeypatch, request_slug):
+    import main
+
+    async def fake_call_llm_router(system_prompt, user_prompt):
+        assert "Human Resources operations specialist" in system_prompt
+        return {"text": "HR response"}
+
+    def fail_load_agent(slug):
+        raise AssertionError("bundle-backed live_test calls must not load legacy Python agents")
+
+    monkeypatch.setattr(main, "call_llm_router", fake_call_llm_router)
+    monkeypatch.setattr(main, "load_agent", fail_load_agent)
+
+    result = await run_agent(
+        request_slug,
+        RunRequest(prompt="Create an onboarding checklist", mode="live_test"),
+    )
+
+    payload = json.loads(result.response)
+    assert result.agentName == "Genesis HR Agent"
+    assert payload["slug"] == "genesis-hr"

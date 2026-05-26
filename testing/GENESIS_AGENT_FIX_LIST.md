@@ -28,7 +28,7 @@ if _prefer_sync_bundle_run(body):
 ### FIX-02: Implement async job polling for ConduitBridge-dependent agents
 **Affects:** Agents 02, 03, 04, 05 + any future agents with `conduit` tools  
 **Severity:** Critical (for production use, not just testing)  
-**Root cause:** Even after FIX-01, these agents will use browser automation for real tasks. Synchronous HTTP will always time out for browser tasks (10-120s). The `genesis-research` bundle already has `job_mode: "async"` — this pattern should be enforced for all conduit agents.
+**Status:** Fixed for Builder, Deploy, and QA by adding `job_mode: "async"` to their bundles. Real `/agents/{slug}/run` requests now enqueue durable jobs and return `job_id` plus `poll_url` instead of holding Render's proxy open during Conduit startup.
 
 **Fix:** 
 1. Return immediately with `{"job_id": "...", "status": "PROCESSING"}` for conduit tasks
@@ -76,7 +76,7 @@ Or add the gateway's Render IP to a whitelist in the throttler config.
 **Root cause:** The two route aliases (`onboarding_agent` and `genesis_hr_x402`) return different inner slug values in their responses — `genesis-onboarding` vs `genesis-hr` respectively. This suggests two different skill bundles are mapped to these aliases, causing inconsistent behavior depending on which slug the caller uses.
 
 **Fix:**
-1. Verify `bundle_loader.py` aliasing table — confirm `genesis_hr_x402` and `onboarding_agent` map to the **same** bundle
+1. Verify `bundle_loader.py` aliasing table — `genesis_hr_x402` and `onboarding_agent` both map to `genesis-hr`
 2. If they map to different bundles, consolidate into one canonical bundle
 3. Ensure inner slug in response always returns the canonical slug, not the alias
 
@@ -129,7 +129,7 @@ Aliasing resolves this functionally, but the inconsistency creates confusion and
 **Fix:** Change the agents-gateway's default model from a hardcoded model string to `"auto"`:
 ```python
 # apps/agents-gateway/.env or agent_runtime.py
-GENESIS_LLM_MODEL=auto   # instead of minimax/minimax-m2.5 or gpt-5-mini
+GENESIS_LLM_MODEL=auto   # default; enables SwarmSync complexity-based routing
 ```
 This enables complexity scoring, proper tier selection, and cost optimization for simple vs. complex tasks.
 

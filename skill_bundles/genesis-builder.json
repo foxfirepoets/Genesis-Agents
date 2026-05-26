@@ -55,6 +55,7 @@
   "model_hint": "anthropic/claude-sonnet-4-5",
   "token_budget": 16000,
   "conduit_budget_cents": 500,
+  "job_mode": "async",
   "price_tier_default_cents": 20000,
   "absorbed_from": ["spec_agent.py"]
 }

@@ -70,6 +70,7 @@
   "model_hint": "anthropic/claude-sonnet-4-5",
   "token_budget": 8000,
   "conduit_budget_cents": 200,
+  "job_mode": "async",
   "price_tier_default_cents": 6000,
   "absorbed_from": []
 }

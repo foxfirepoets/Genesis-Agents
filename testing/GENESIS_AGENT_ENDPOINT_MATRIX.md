@@ -7,10 +7,10 @@
 | # | Agent Name | Marketplace Slug | Gateway Slug | Tested Endpoint | Alt Slug Works? | Working Payload | HTTP Status | Exec Score | Routing Score | Final Verdict |
 |---|-----------|-----------------|-------------|----------------|-----------------|----------------|------------|-----------|--------------|--------------|
 | 01 | Genesis Meta Agent | `genesis_meta_agent` | `genesis_meta_agent` | `/agents/genesis_meta_agent/run` | N/A | `{input, task, mode: "live_test"}` | 200 | 5/5 | 1/5 | LIVE AND FUNCTIONAL |
-| 02 | Genesis Builder Agent | `genesis_builder_x402` | `genesis-builder` | `/agents/genesis_builder_x402/run` | N/A | None (timeout) | 000 | 0/5 | 0/5 | ENDPOINT LIVE BUT NOT EXECUTING |
+| 02 | Genesis Builder Agent | `genesis_builder_x402` | `genesis-builder` | `/agents/genesis_builder_x402/run` | N/A | `{job_id, poll_url}` for real tasks | 202-style payload | N/A | N/A | ASYNC JOB FLOW |
 | 03 | Genesis Research Agent | `genesis_research_x402` | `genesis-research` | `/agents/genesis_research_x402/run` | N/A | None (timeout) | 000 | 0/5 | 0/5 | ENDPOINT LIVE BUT NOT EXECUTING |
-| 04 | Genesis Deploy Agent | `genesis_deploy_x402` | `genesis-deploy` | `/agents/genesis_deploy_x402/run` | N/A | None (timeout) | 000 | 0/5 | 0/5 | ENDPOINT LIVE BUT NOT EXECUTING |
-| 05 | Genesis QA Agent | `genesis_qa_x402` | `genesis-qa` | `/agents/genesis_qa_x402/run` | N/A | None (timeout) | 000 | 0/5 | 0/5 | ENDPOINT LIVE BUT NOT EXECUTING |
+| 04 | Genesis Deploy Agent | `genesis_deploy_x402` | `genesis-deploy` | `/agents/genesis_deploy_x402/run` | N/A | `{job_id, poll_url}` for real tasks | 202-style payload | N/A | N/A | ASYNC JOB FLOW |
+| 05 | Genesis QA Agent | `genesis_qa_x402` | `genesis-qa` | `/agents/genesis_qa_x402/run` | N/A | `{job_id, poll_url}` for real tasks | 202-style payload | N/A | N/A | ASYNC JOB FLOW |
 | 06 | Genesis Content Agent | `genesis_content_x402` | `genesis-content` | `/agents/genesis_content_x402/run` | N/A | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
 | 07 | Genesis Email Agent | `genesis_email_x402` | `genesis-email` | `/agents/genesis_email_x402/run` | N/A | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
 | 08 | Genesis Commerce Agent | `genesis_commerce_x402` | `genesis-commerce` | `/agents/genesis_commerce_x402/run` | N/A | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
@@ -22,7 +22,7 @@
 | 14 | Genesis Marketing Agent | `genesis_marketing_x402` | `genesis-marketing` | `/agents/genesis_marketing_x402/run` | N/A | `{input, task, mode}` | 200 | 5/5 | 4/5 | LIVE AND FUNCTIONAL |
 | 15 | Genesis SEO Agent | `genesis_seo_x402` | `genesis-seo` | `/agents/genesis_seo_x402/run` | N/A | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
 | 16 | Genesis Legal Agent | `genesis_legal_x402` | `legal_agent` ⚠️ | `/agents/legal_agent/run` | ✅ 200 | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
-| 17 | Genesis HR Agent | `genesis_hr_x402` | `onboarding_agent` ⚠️ | `/agents/onboarding_agent/run` | ✅ 200 (diff inner slug) | `{input, task, mode}` | 200 | 4/5 | 5/5 | PARTIALLY FUNCTIONAL |
+| 17 | Genesis HR Agent | `genesis_hr_x402` | `onboarding_agent` | `/agents/onboarding_agent/run` | ✅ 200 (same inner slug: `genesis-hr`) | `{input, task, mode}` | 200 | 4/5 | 5/5 | FUNCTIONAL |
 | 18 | Genesis Data Pipeline | `genesis-data-pipeline` | `genesis-data-pipeline-agent` ⚠️ | `/agents/genesis-data-pipeline-agent/run` | ✅ 200 | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
 | 19 | Genesis Workflow Automator | `genesis-workflow-automator` | `genesis-workflow-automator` | `/agents/genesis-workflow-automator/run` | N/A | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
 | 20 | Genesis AI Vision API | `genesis-ai-vision-api` | `genesis-ai-vision-api` | `/agents/genesis-ai-vision-api/run` | N/A | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
@@ -34,9 +34,9 @@
 | Field | Value |
 |-------|-------|
 | LLM Router URL | `https://api.swarmsync.ai/v1/chat/completions` |
-| Default model | `openai/gpt-5-mini` |
+| Default model | `auto` (SwarmSync complexity routing) |
 | Default tier | `mid` |
-| Routing mode | `direct_model_request` (complexity_score always -1, no smart routing) |
+| Routing mode | `auto` (SwarmSync complexity scoring enabled) |
 | Quality gate mode | `shadow` (monitoring only, not blocking) |
 | Auth required | `X-Agent-Api-Key` header (GATEWAY_API_KEY) |
 | Known bypass | Gemini 2.0 Flash Lite — direct Google API fallback in persona/negotiate path |
@@ -46,7 +46,7 @@
 | Agent | Marketplace Slug | Gateway Slug | Resolution |
 |-------|-----------------|-------------|-----------|
 | 16 Legal | `genesis_legal_x402` | `legal_agent` | Aliased — both work |
-| 17 HR | `genesis_hr_x402` | `onboarding_agent` | Aliased — but different inner slugs returned |
+| 17 HR | `genesis_hr_x402` | `onboarding_agent` | Aliased — both resolve to `genesis-hr` |
 | 18 Data Pipeline | `genesis-data-pipeline` | `genesis-data-pipeline-agent` | Aliased — both work |
 
 ## Pass/Fail Summary
