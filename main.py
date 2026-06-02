@@ -806,38 +806,6 @@ def _raise_for_runtime_failure(result: dict[str, Any], slug: str) -> None:
         },
     )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-# gemini-2.0-flash-lite: $0.075/M input — ~3x cheaper than claude-haiku, no daily rate limit
-GEMINI_FALLBACK_MODEL = "gemini-2.0-flash-lite"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_FALLBACK_MODEL}:generateContent"
-
-
-async def call_gemini_fallback(system_prompt: str, user_prompt: str) -> str:
-    """Fallback to Gemini Flash Lite when the configured LLM router is rate-limited."""
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=503, detail="No fallback API key configured (GEMINI_API_KEY unset)")
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            GEMINI_URL,
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY,
-            },
-            json={
-                "system_instruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"parts": [{"text": user_prompt}]}],
-                "generationConfig": {"maxOutputTokens": 512},
-            },
-        )
-    if not (200 <= resp.status_code < 300):
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini fallback returned {resp.status_code}: {resp.text[:200]}",
-        )
-    data = resp.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
-
-
 async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any]:
     """Call SwarmSync /v1/chat/completions; return text + swarmsync routing metadata."""
     api_key = _llm_api_key()
@@ -848,6 +816,16 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
         )
     url = _llm_api_url()
 
+    router_headers: dict[str, str] = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://swarmsync.ai",
+        "X-Title": "SwarmSync Agent Gateway",
+    }
+    gateway_secret = os.getenv("AGENT_GATEWAY_SECRET", "").strip()
+    if gateway_secret:
+        router_headers["X-Agent-Gateway-Secret"] = gateway_secret
+
     backoffs = [2.0]
     last_exc: HTTPException | None = None
     models = list(dict.fromkeys(m for m in ROUTER_FALLBACK_MODELS if m))
@@ -857,12 +835,7 @@ async def call_llm_router(system_prompt: str, user_prompt: str) -> dict[str, Any
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
                     url,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                        "HTTP-Referer": "https://swarmsync.ai",
-                        "X-Title": "SwarmSync Agent Gateway",
-                    },
+                    headers=router_headers,
                     json={
                         "model": model_id,
                         "messages": [
@@ -952,7 +925,7 @@ async def _run_loaded_agent(agent: Any, user_prompt: str, slug: str) -> Optional
     - module-level execute(prompt)
 
     Returns the response text on success, or None to signal the caller to fall
-    back to the Llama/Gemini persona path.
+    back to the SwarmSync router persona path.
     """
     import inspect
     import types
@@ -2018,19 +1991,13 @@ async def evaluate_negotiation(slug: str, request: NegotiateRequest) -> dict:
     try:
         raw = await call_llm_router(system_prompt, negotiation_prompt)
     except HTTPException as e:
-        if e.status_code == 429 and GEMINI_API_KEY:
-            logger.warning(
-                "LLM router rate-limited for negotiate slug=%s — falling back to Gemini Flash Lite",
-                slug,
-            )
-            try:
-                raw = await call_gemini_fallback(system_prompt, negotiation_prompt)
-            except Exception as fallback_exc:
-                logger.error("Gemini fallback also failed for negotiate slug=%s: %s", slug, fallback_exc)
-                return default_decision
-        else:
-            logger.error("LLM router error for negotiate slug=%s: %s", slug, e.detail)
-            return default_decision
+        logger.error(
+            "LLM router error for negotiate slug=%s status=%s: %s",
+            slug,
+            e.status_code,
+            e.detail,
+        )
+        return default_decision
     except Exception as exc:
         logger.error("Unexpected error calling LLM for negotiate slug=%s: %s", slug, exc)
         return default_decision

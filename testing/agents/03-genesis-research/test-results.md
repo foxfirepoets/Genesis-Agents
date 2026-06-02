@@ -1,32 +1,43 @@
 # Agent 03 — Genesis Research Agent
 
-## Test Metadata
-- **Tested:** 2026-05-23
+## Endpoint
+
 - **Endpoint:** `POST https://swarmsync-agents.onrender.com/agents/genesis_research_x402/run`
 - **Marketplace slug:** `genesis_research_x402`
 - **Gateway slug:** `genesis-research` (bundle slug)
 
-## HTTP Status
-- **Full payload:** HTTP 000 (timeout — same ConduitBridge issue)
-- **Short probe:** HTTP 200 (endpoint alive)
-- **Earlier attempt:** HTTP 429 (throttler)
+## Async job flow (current)
 
-## Root Cause
-`genesis-research` bundle lists `conduit`, `web_search`, `web_fetch`, and `job_mode: "async"` in tools_advertised. AgentRuntime attempts Patchright browser startup + async job queue init before LLM call. Both paths exceed Render's 30s proxy timeout. `mode: "live_test"` forces sync path (skips job queue) but does NOT bypass AgentRuntime — so browser startup still blocks.
+`genesis-research` bundle has `job_mode: "async"` (same as Builder, Deploy, QA, Meta). Real `/run` requests **without** `mode: "live_test"` enqueue a durable job and return immediately:
 
-## Issues
-| Severity | Issue |
-|----------|-------|
-| Critical | Same ConduitBridge startup timeout as Builder |
-| Medium | `job_mode: "async"` means this agent was designed for async polling — testing with sync calls will always time out even after the fix |
+```json
+{
+  "status": "QUEUED",
+  "slug": "genesis-research",
+  "job_id": "<uuid>",
+  "poll_url": "/agents/jobs/<uuid>"
+}
+```
 
-## Recommended Fix
-1. Apply `mode: "live_test"` bypass to all agents in main.py
-2. For research/async agents: expose a `GET /agents/{slug}/jobs/{jobId}` polling endpoint and test via that flow
+Poll `GET /agents/jobs/{job_id}` until `DELIVERED` or `FAILED`. The worker runs Conduit/browser work off the Render proxy timeout path.
 
-## Scores
-- **Execution score: 0/5**
-- **Routing score: 0/5**
+## Regression coverage
 
-## Verdict
-**ENDPOINT LIVE BUT NOT EXECUTING** (ConduitBridge timeout + async job mode)
+- `test_gateway_error_mapping.py::test_conduit_heavy_run_requests_enqueue_async_jobs` includes `genesis_research_x402`
+- `skill_bundles/genesis-research.json` — `job_mode: "async"`
+- `test_agent_runtime.py` — bundle load for `genesis-research`
+
+## Live test notes
+
+| Mode | Behavior |
+|------|----------|
+| Default (real task) | Async queue — expect `job_id` + `poll_url`, not a full answer in 30s |
+| `mode: "live_test"` | Fast persona router only — skips job queue **and** AgentRuntime (no browser) |
+
+Earlier reports of HTTP 000 / timeout were from holding the sync path open during Conduit startup. That path is no longer used for production-shaped calls.
+
+## Deploy checklist
+
+1. `job_store` / `GENESIS_JOB_DATABASE_URL` configured on gateway + worker
+2. Worker service running (`worker.py` polls `genesis_jobs`)
+3. SwarmSync API FIX-03 deployed so shared Render IP does not 429 the router

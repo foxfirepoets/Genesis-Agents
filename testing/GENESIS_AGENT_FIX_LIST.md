@@ -41,18 +41,13 @@ if _prefer_sync_bundle_run(body):
 ## 🟠 HIGH — Fix Before Public Beta
 
 ### FIX-03: Add `@SkipThrottle` decorator to internal gateway→router calls
+**Status:** Fixed in SwarmSync `apps/api/src/modules/routing/routing.controller.ts` — `POST /v1/chat/completions` skips global per-IP throttlers; `PerKeyRateLimitGuard` + route `@Throttle(200/min)` remain. Gateway sends `X-Agent-Gateway-Secret` when `AGENT_GATEWAY_SECRET` is set.
+
+**Deploy (SwarmSync API):** Redeploy `swarmsync-api` after merging. No new env vars required for the exemption itself. Optional: set matching `AGENT_GATEWAY_SECRET` on both `swarmsync-api` and `swarmsync-agents` so gateway LLM calls include `X-Agent-Gateway-Secret` (used for future stricter allowlists). Per-key limits still apply via the gateway's `LLM_API_KEY` (`sk-ss-*`).
+
 **Affects:** All 20 agents (intermittent 429 errors)  
 **Severity:** High  
 **Root cause:** SwarmSync API's NestJS global ThrottlerModule limits 100 req/min per IP. The agents-gateway (Render) has a single outbound IP — all 20 agents share one IP quota. Rapid parallel testing or burst usage hits this limit.
-
-**Fix:**
-```typescript
-// apps/api/src/modules/routing/routing.controller.ts
-@SkipThrottle()
-@Post('v1/chat/completions')
-async chatCompletions(...) { ... }
-```
-Or add the gateway's Render IP to a whitelist in the throttler config.
 
 ---
 
@@ -147,6 +142,7 @@ This enables complexity scoring, proper tier selection, and cost optimization fo
 ## 🟢 LOW — Cleanup / Quality of Life
 
 ### FIX-11: Eliminate Gemini direct-API fallback (routing bypass)
+**Status:** Fixed — removed `call_gemini_fallback` / `generativelanguage.googleapis.com` from `main.py`; negotiate returns safe default on router 429. Regression: `test_main_py_has_no_direct_google_generative_language_api`, `test_call_llm_router_targets_swarmsync_only`.
 **Affects:** All agents using the persona/negotiate path  
 **Severity:** Low  
 **Root cause:** Legacy path has a hardcoded Gemini 2.0 Flash Lite fallback via direct `https://generativelanguage.googleapis.com/...` — bypasses SwarmSync Routing completely. No routing metadata, no cost tracking, no tier selection.
@@ -168,7 +164,7 @@ This enables complexity scoring, proper tier selection, and cost optimization fo
 |---|-----|----------|----------------|--------|
 | FIX-01 | Extend live_test bypass to all agents | 🔴 Critical | 02, 03, 04, 05 | 1 line |
 | FIX-02 | Async job polling for conduit agents | 🔴 Critical | 02, 03, 04, 05 | Medium |
-| FIX-03 | SkipThrottle for gateway→router | 🟠 High | All 20 | Small |
+| FIX-03 | SkipThrottle for gateway→router | ✅ Done | All 20 | Small |
 | FIX-04 | Expand Finance Agent scope | 🟠 High | 10 | Small |
 | FIX-05 | Fix HR agent inner slug mismatch | 🟠 High | 17 | Small |
 | FIX-06 | Fix ChatGPT identity leak | 🟡 Medium | 06, 15, 17 | Small |
@@ -176,5 +172,5 @@ This enables complexity scoring, proper tier selection, and cost optimization fo
 | FIX-08 | Normalize marketplace/gateway slugs | 🟡 Medium | 16, 17, 18 | Small |
 | FIX-09 | Enable auto routing tier selection | 🟡 Medium | All 20 | Small |
 | FIX-10 | Surface routing metadata for Agent 01 | 🟡 Medium | 01 | Small |
-| FIX-11 | Remove Gemini direct-API fallback | 🟢 Low | Legacy path | Small |
+| FIX-11 | Remove Gemini direct-API fallback | ✅ Done | Legacy path | Small |
 | FIX-12 | Add latency monitoring/alerting | 🟢 Low | 08, 11, 14, 19 | Small |

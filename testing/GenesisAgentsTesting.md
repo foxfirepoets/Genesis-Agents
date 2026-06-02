@@ -22,7 +22,7 @@ The routing layer works. All live agents route through `https://api.swarmsync.ai
 |---|-------|----------|------|------|-------|---------|
 | 01 | Genesis Meta Agent | `/agents/genesis_meta_agent/run` | 200 | 5/5 | 1/5 | ✅ LIVE AND FUNCTIONAL |
 | 02 | Genesis Builder Agent | `/agents/genesis_builder_x402/run` | 000 | 0/5 | 0/5 | ❌ ENDPOINT LIVE BUT NOT EXECUTING |
-| 03 | Genesis Research Agent | `/agents/genesis_research_x402/run` | 000 | 0/5 | 0/5 | ❌ ENDPOINT LIVE BUT NOT EXECUTING |
+| 03 | Genesis Research Agent | `/agents/genesis_research_x402/run` | 202-style | N/A | N/A | ✅ ASYNC JOB FLOW (poll `/agents/jobs/{job_id}`) |
 | 04 | Genesis Deploy Agent | `/agents/genesis_deploy_x402/run` | 000 | 0/5 | 0/5 | ❌ ENDPOINT LIVE BUT NOT EXECUTING |
 | 05 | Genesis QA Agent | `/agents/genesis_qa_x402/run` | 000 | 0/5 | 0/5 | ❌ ENDPOINT LIVE BUT NOT EXECUTING |
 | 06 | Genesis Content Agent | `/agents/genesis_content_x402/run` | 200 | 5/5 | 5/5 | ✅ LIVE AND FUNCTIONAL |
@@ -108,7 +108,7 @@ Fix: Keep `GENESIS_LLM_MODEL=auto` in agents-gateway Render environment.
 
 ### Known Routing Bypass
 
-Legacy persona path has a hardcoded Gemini 2.0 Flash Lite fallback via direct Google API (`https://generativelanguage.googleapis.com/...`). Triggered on 429 from SwarmSync router. Bypasses routing completely — no metadata, no cost tracking, no quality gate.
+**Closed (2026-06-02):** Direct Google Gemini fallback removed from `main.py`. Persona and negotiate stay on SwarmSync `/v1/chat/completions` with `swarmsync` metadata. Regression: `test_gateway_error_mapping.py`.
 
 ---
 
@@ -154,7 +154,7 @@ After this change, agents 02-05 route via the fast persona LLM path (no browser,
 | BUG-08 | 07 | Quality gate false positive on `{{token}}` email placeholders | Medium |
 | BUG-09 | 16, 17, 18 | Slug discrepancy between marketplace and gateway (aliasing resolves it) | Medium |
 | BUG-10 | 01 | Routing metadata not surfaced in API response (internal only for persona path) | Medium |
-| BUG-11 | Legacy | Gemini 2.0 Flash Lite fallback bypasses SwarmSync Routing entirely | Low |
+| BUG-11 | Legacy | ~~Gemini direct-API bypass~~ **Fixed** — router-only path | Closed |
 | BUG-12 | 08, 11, 14, 19 | Response times 40-60s — risk of production timeouts | Low |
 
 ---

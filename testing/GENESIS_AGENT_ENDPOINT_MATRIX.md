@@ -8,7 +8,7 @@
 |---|-----------|-----------------|-------------|----------------|-----------------|----------------|------------|-----------|--------------|--------------|
 | 01 | Genesis Meta Agent | `genesis_meta_agent` | `genesis_meta_agent` | `/agents/genesis_meta_agent/run` | N/A | `{input, task, mode: "live_test"}` | 200 | 5/5 | 1/5 | LIVE AND FUNCTIONAL |
 | 02 | Genesis Builder Agent | `genesis_builder_x402` | `genesis-builder` | `/agents/genesis_builder_x402/run` | N/A | `{job_id, poll_url}` for real tasks | 202-style payload | N/A | N/A | ASYNC JOB FLOW |
-| 03 | Genesis Research Agent | `genesis_research_x402` | `genesis-research` | `/agents/genesis_research_x402/run` | N/A | None (timeout) | 000 | 0/5 | 0/5 | ENDPOINT LIVE BUT NOT EXECUTING |
+| 03 | Genesis Research Agent | `genesis_research_x402` | `genesis-research` | `/agents/genesis_research_x402/run` | N/A | `{job_id, poll_url}` for real tasks | 202-style payload | N/A | N/A | ASYNC JOB FLOW |
 | 04 | Genesis Deploy Agent | `genesis_deploy_x402` | `genesis-deploy` | `/agents/genesis_deploy_x402/run` | N/A | `{job_id, poll_url}` for real tasks | 202-style payload | N/A | N/A | ASYNC JOB FLOW |
 | 05 | Genesis QA Agent | `genesis_qa_x402` | `genesis-qa` | `/agents/genesis_qa_x402/run` | N/A | `{job_id, poll_url}` for real tasks | 202-style payload | N/A | N/A | ASYNC JOB FLOW |
 | 06 | Genesis Content Agent | `genesis_content_x402` | `genesis-content` | `/agents/genesis_content_x402/run` | N/A | `{input, task, mode}` | 200 | 5/5 | 5/5 | LIVE AND FUNCTIONAL |
@@ -39,7 +39,7 @@
 | Routing mode | `auto` (SwarmSync complexity scoring enabled) |
 | Quality gate mode | `shadow` (monitoring only, not blocking) |
 | Auth required | `X-Agent-Api-Key` header (GATEWAY_API_KEY) |
-| Known bypass | Gemini 2.0 Flash Lite — direct Google API fallback in persona/negotiate path |
+| Known bypass | None — persona/negotiate stay on SwarmSync `/v1/chat/completions` (regression: `test_gateway_error_mapping.py`) |
 
 ## Slug Discrepancy Summary
 
