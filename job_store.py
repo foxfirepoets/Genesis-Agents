@@ -183,6 +183,35 @@ def heartbeat(job_id: str) -> bool:
         return cur.rowcount > 0
 
 
+def claim_job_by_id(job_id: str) -> dict[str, Any] | None:
+    """Atomically claim one QUEUED job by id."""
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE genesis_jobs
+            SET status = 'RUNNING',
+                "startedAt" = COALESCE("startedAt", NOW()),
+                "updatedAt" = NOW()
+            WHERE id = %s AND status = 'QUEUED'
+            RETURNING *
+            """,
+            (job_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cur.execute(
+            """
+            INSERT INTO genesis_job_events
+              (id, "jobId", "eventType", "fromStatus", "toStatus", "createdAt")
+            VALUES (%s, %s, 'status_change', 'QUEUED', 'RUNNING', NOW())
+            """,
+            (_gen_id(), job_id),
+        )
+        conn.commit()
+        return row
+
+
 def claim_queued_jobs(limit: int = 5) -> list[dict[str, Any]]:
     """Atomically claim QUEUED jobs by transitioning them to RUNNING."""
     with _conn() as conn, conn.cursor() as cur:

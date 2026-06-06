@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio, json, logging, os, signal, sys, time
 from typing import Any
 import httpx
-from job_store import claim_queued_jobs, heartbeat, update_job_status, expire_stale_running_jobs
+from job_store import claim_job_by_id, claim_queued_jobs, heartbeat, update_job_status, expire_stale_running_jobs
 from agent_runtime import AgentRuntime
 
 log = logging.getLogger("worker")
@@ -209,13 +209,61 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
                 log.exception("fire_callback raised unexpectedly for job %s", job_id)
 
 
+def _make_runtime() -> AgentRuntime:
+    from main import _llm_api_key, _llm_api_url  # reuse the gateway's env-driven LLM config
+
+    return AgentRuntime(llm_url=_llm_api_url(), llm_key=_llm_api_key())
+
+
+async def execute_job_by_id(job_id: str) -> dict[str, Any]:
+    """Claim and process a single QUEUED job (Trigger.dev event-driven path)."""
+    expired = expire_stale_running_jobs(stale_minutes=5)
+    job = claim_job_by_id(job_id)
+    if not job:
+        return {"ok": False, "job_id": job_id, "error": "not_queued_or_missing", "expired": expired}
+
+    runtime = _make_runtime()
+    await process_job(job, runtime)
+    return {"ok": True, "job_id": job_id, "expired": expired}
+
+
+async def run_tick(*, limit: int | None = None, expire_stale: bool = True) -> dict[str, Any]:
+    """Process one worker iteration — used by Trigger.dev HTTP dispatch."""
+    slots = limit if limit is not None else WORKER_CONCURRENCY
+    slots = max(0, int(slots))
+
+    expired = 0
+    if expire_stale:
+        expired = expire_stale_running_jobs(stale_minutes=5)
+        if expired:
+            log.info("expired %d stale RUNNING jobs", expired)
+
+    if slots <= 0:
+        return {"expired": expired, "claimed": 0, "processed": 0, "job_ids": []}
+
+    jobs = claim_queued_jobs(limit=slots)
+    if not jobs:
+        return {"expired": expired, "claimed": 0, "processed": 0, "job_ids": []}
+
+    runtime = _make_runtime()
+    job_ids: list[str] = []
+    for job in jobs:
+        await process_job(job, runtime)
+        job_ids.append(job["id"])
+
+    return {
+        "expired": expired,
+        "claimed": len(jobs),
+        "processed": len(job_ids),
+        "job_ids": job_ids,
+    }
+
+
 async def main():
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    from agent_runtime import AgentRuntime
-    from main import _llm_api_url, _llm_api_key  # reuse the gateway's env-driven LLM config
-    runtime = AgentRuntime(llm_url=_llm_api_url(), llm_key=_llm_api_key())
+    runtime = _make_runtime()
 
     sem = asyncio.Semaphore(WORKER_CONCURRENCY)
     in_flight: set[asyncio.Task] = set()

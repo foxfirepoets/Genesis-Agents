@@ -1669,6 +1669,15 @@ async def submit_job(slug: str, body: dict):
     }
     if external_escrow_id:
         payload["external_escrow_id"] = external_escrow_id
+
+    if not job.get("idempotent_hit"):
+        try:
+            from trigger_dispatch import dispatch_genesis_job
+
+            dispatch_genesis_job(job["id"])
+        except Exception:
+            logger.exception("trigger dispatch failed for job %s", job.get("id"))
+
     return payload
 
 
@@ -1686,6 +1695,59 @@ async def get_job_status(job_id: str):
         if job.get(k):
             job[k] = job[k].isoformat() if hasattr(job[k], "isoformat") else str(job[k])
     return job
+
+
+@app.post("/internal/genesis-worker/tick")
+async def genesis_worker_tick(
+    body: dict | None = None,
+    x_internal_secret: str | None = Header(None, alias="X-Internal-Secret"),
+):
+    """Run one Genesis job-worker poll cycle (legacy fallback)."""
+    _require_internal_secret(x_internal_secret)
+
+    if not _JOB_STORE_OK:
+        raise HTTPException(status_code=503, detail="job_store unavailable")
+
+    limit = 3
+    if body and body.get("limit") is not None:
+        try:
+            limit = max(0, min(10, int(body["limit"])))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="limit must be an integer 0-10")
+
+    try:
+        from worker import run_tick
+
+        result = await run_tick(limit=limit, expire_stale=True)
+        return {"ok": True, **result}
+    except Exception as e:
+        logger.exception("genesis_worker_tick failed")
+        raise HTTPException(status_code=500, detail=f"genesis_worker_tick_failed: {e}")
+
+
+@app.post("/internal/genesis-worker/jobs/{job_id}/execute")
+async def genesis_worker_execute_job(
+    job_id: str,
+    x_internal_secret: str | None = Header(None, alias="X-Internal-Secret"),
+):
+    """Claim and execute one QUEUED genesis job (Trigger.dev genesis-job-process)."""
+    _require_internal_secret(x_internal_secret)
+
+    if not _JOB_STORE_OK:
+        raise HTTPException(status_code=503, detail="job_store unavailable")
+
+    try:
+        from worker import execute_job_by_id
+
+        result = await execute_job_by_id(job_id)
+        if not result.get("ok"):
+            raise HTTPException(status_code=409, detail=result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("genesis_worker_execute_job failed job=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"genesis_worker_execute_failed: {e}")
 
 
 # ============================================================================
