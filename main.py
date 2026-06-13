@@ -1957,9 +1957,12 @@ async def genesis_worker_tick(
 
     try:
         from worker import run_tick
+        import asyncio
 
-        result = await run_tick(limit=limit, expire_stale=True)
-        return {"ok": True, **result}
+        # Fire-and-forget: launch in background so client doesn't timeout waiting
+        # for long-running jobs (genesis-meta can take 60-120s+).
+        asyncio.create_task(run_tick(limit=limit, expire_stale=True))
+        return {"ok": True, "claimed": -1, "processed": -1, "job_ids": [], "dispatched": True}
     except Exception as e:
         logger.exception("genesis_worker_tick failed")
         raise HTTPException(status_code=500, detail=f"genesis_worker_tick_failed: {e}")
