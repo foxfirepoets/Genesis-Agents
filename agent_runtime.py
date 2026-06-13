@@ -501,11 +501,15 @@ class AgentRuntime:
                 "GENESIS_ALLOW_OPENROUTER_FALLBACK=true"
             )
 
-        primary = (os.getenv("GENESIS_LLM_MODEL") or DEFAULT_SWARMSYNC_MODEL).strip()
-        # "auto" is a valid SwarmSync router alias — pass it through so the router
-        # runs complexity scoring and selects the best model/tier. Do NOT replace it
-        # with a hardcoded model string here; doing so disables smart routing entirely.
-        model_candidates = [primary or model, "openrouter/free", "minimax/minimax-m2.5:free"]
+        env_model = (os.getenv("GENESIS_LLM_MODEL") or "").strip()
+        # When the env var is "auto" or absent, respect the bundle's model_hint so
+        # agents that need function-calling (e.g. genesis-meta) get a capable model.
+        # A non-"auto" env value (e.g. "anthropic/claude-haiku-4-5") overrides all bundles.
+        if env_model and env_model != "auto":
+            primary = env_model
+        else:
+            primary = model if (model and model != "auto") else DEFAULT_SWARMSYNC_MODEL
+        model_candidates = [primary, "openrouter/free", "minimax/minimax-m2.5:free"]
         deduped: list[str] = []
         for m in model_candidates:
             if m and m not in deduped:
