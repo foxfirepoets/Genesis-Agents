@@ -57,6 +57,9 @@ from conduit_verifier import run_verification
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Strong references to fire-and-forget background tasks (asyncio only keeps weak refs).
+_background_tasks: set = set()
+
 
 try:
     # Optional: dynamic Python agent loading; gateway must still function
@@ -1961,7 +1964,10 @@ async def genesis_worker_tick(
 
         # Fire-and-forget: launch in background so client doesn't timeout waiting
         # for long-running jobs (genesis-meta can take 60-120s+).
-        asyncio.create_task(run_tick(limit=limit, expire_stale=True))
+        # Store task in _background_tasks so asyncio doesn't GC it before completion.
+        task = asyncio.create_task(run_tick(limit=limit, expire_stale=True))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
         return {"ok": True, "claimed": -1, "processed": -1, "job_ids": [], "dispatched": True}
     except Exception as e:
         logger.exception("genesis_worker_tick failed")
