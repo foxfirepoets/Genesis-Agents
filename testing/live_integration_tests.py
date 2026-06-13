@@ -466,6 +466,26 @@ def test_meta_real_orchestration() -> bool:
         with urllib.request.urlopen(req, timeout=20) as r:
             return json.loads(r.read())
 
+    # Pre-drain: clear any stale QUEUED jobs from prior test runs so they don't steal
+    # the single worker slot before this test's job gets picked up.
+    if RENDER_INTERNAL_SECRET:
+        try:
+            drain_req = urllib.request.Request(
+                f"{RENDER_URL}/internal/genesis-worker/tick",
+                data=json.dumps({"limit": 10}).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Internal-Secret": RENDER_INTERNAL_SECRET,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(drain_req, timeout=30) as r:
+                drain_resp = json.loads(r.read())
+            print(f"  Pre-drain tick: {drain_resp}")
+            time.sleep(5)  # Give the background task time to claim stale jobs
+        except Exception as e:
+            print(f"  Pre-drain tick failed (non-fatal): {e}")
+
     # Submit to genesis-meta WITHOUT mode:live_test so the full AgentRuntime path runs.
     # The prompt explicitly instructs Meta to call genesis_call twice.
     try:
@@ -505,7 +525,7 @@ def test_meta_real_orchestration() -> bool:
             time.sleep(2)
             tick_req = urllib.request.Request(
                 f"{RENDER_URL}/internal/genesis-worker/tick",
-                data=json.dumps({"limit": 1}).encode(),
+                data=json.dumps({"limit": 10}).encode(),
                 headers={
                     "Content-Type": "application/json",
                     "X-Internal-Secret": RENDER_INTERNAL_SECRET,
@@ -523,6 +543,7 @@ def test_meta_real_orchestration() -> bool:
     # Poll up to 5 minutes — Meta orchestration takes longer than simple agents
     deadline = time.time() + 300
     last_status = "UNKNOWN"
+    _last_tick_at = time.time()
     while time.time() < deadline:
         time.sleep(8)
         try:
@@ -533,6 +554,26 @@ def test_meta_real_orchestration() -> bool:
 
         last_status = status_resp.get("status", "UNKNOWN")
         print(f"  [{time.strftime('%H:%M:%S')}] status={last_status}")
+
+        # Re-tick every 45s if still QUEUED — handles cases where the background
+        # task silently failed (DB error etc.) or a stale job beat us to the slot.
+        if last_status == "QUEUED" and RENDER_INTERNAL_SECRET and (time.time() - _last_tick_at) > 45:
+            try:
+                retick_req = urllib.request.Request(
+                    f"{RENDER_URL}/internal/genesis-worker/tick",
+                    data=json.dumps({"limit": 10}).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Internal-Secret": RENDER_INTERNAL_SECRET,
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(retick_req, timeout=30) as r:
+                    retick_resp = json.loads(r.read())
+                print(f"  Re-tick (still QUEUED): {retick_resp}")
+                _last_tick_at = time.time()
+            except Exception as e:
+                print(f"  Re-tick failed (non-fatal): {e}")
 
         if last_status in ("DELIVERED", "DELIVERED_WITH_ARTIFACT_WARNING"):
             break

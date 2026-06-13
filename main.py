@@ -1965,7 +1965,16 @@ async def genesis_worker_tick(
         # Fire-and-forget: launch in background so client doesn't timeout waiting
         # for long-running jobs (genesis-meta can take 60-120s+).
         # Store task in _background_tasks so asyncio doesn't GC it before completion.
-        task = asyncio.create_task(run_tick(limit=limit, expire_stale=True))
+        _tick_limit = limit
+
+        async def _tick_logged():
+            try:
+                result = await run_tick(limit=_tick_limit, expire_stale=True)
+                logger.info("genesis_worker_tick_complete result=%s", result)
+            except Exception:
+                logger.exception("genesis_worker_tick_background_error limit=%d", _tick_limit)
+
+        task = asyncio.create_task(_tick_logged())
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
         return {"ok": True, "claimed": -1, "processed": -1, "job_ids": [], "dispatched": True}
