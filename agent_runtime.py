@@ -226,6 +226,8 @@ class AgentRuntime:
         files_written = 0
         success_criteria = bundle.get("success_criteria")
 
+        tool_call_records: list[dict[str, Any]] = []
+
         while turn < MAX_TURNS:
             turn += 1
             if time.time() - started > timeout_s:
@@ -306,7 +308,7 @@ class AgentRuntime:
                         "agent_slug": slug,
                         "workspace_path": str(job_dir),
                         "artifact_count": files_written,
-                        "tool_calls": turn,
+                        "tool_calls": tool_call_records,
                         "started_at": started,
                         "finished_at": _finished_at,
                         "status": "ok",
@@ -383,6 +385,7 @@ class AgentRuntime:
                 except Exception:
                     args = {}
 
+                tc_started = time.time()
                 tool = get_tool(fn_name)
                 if tool is None or fn_name not in tools_advertised:
                     tool_result: dict[str, Any] = {
@@ -400,8 +403,13 @@ class AgentRuntime:
                             "limit": MAX_FILES_WRITTEN,
                         }
                     else:
-                        # Inject context: bridge, job_dir, runtime
-                        ctx = {"_bridge": bridge, "_job_dir": job_dir, "_runtime": self}
+                        # Inject context: bridge, job_dir, runtime, parent_job_id
+                        ctx = {
+                            "_bridge": bridge,
+                            "_job_dir": job_dir,
+                            "_runtime": self,
+                            "_parent_job_id": job_id,
+                        }
                         try:
                             tool_result = await tool(**args, **ctx)
                             # Phase 11 — count successful file writes.
@@ -419,6 +427,38 @@ class AgentRuntime:
                                 "type": type(e).__name__,
                                 "message": str(e),
                             }
+
+                tc_finished = time.time()
+
+                # Build structured trace record
+                record: dict[str, Any] = {
+                    "turn": turn,
+                    "tool_name": fn_name,
+                    "tool_call_id": tc_id,
+                    "arguments": {k: v for k, v in args.items() if not k.startswith("_")},
+                    "ok": bool(tool_result.get("ok")) if isinstance(tool_result, dict) else False,
+                    "result_summary": json.dumps(tool_result)[:300] if isinstance(tool_result, dict) else str(tool_result)[:300],
+                    "started_at": tc_started,
+                    "finished_at": tc_finished,
+                    "elapsed_s": round(tc_finished - tc_started, 3),
+                    "parent_job_id": job_id,
+                    "parent_agent_slug": slug,
+                }
+                # genesis_call gets extra linkage fields
+                if fn_name == "genesis_call" and isinstance(tool_result, dict):
+                    record["target_agent_slug"] = (
+                        tool_result.get("target_agent_slug")
+                        or tool_result.get("agent", "")
+                    )
+                    record["child_job_id"] = tool_result.get("child_job_id")
+                    record["child_ok"] = tool_result.get(
+                        "child_ok", bool(tool_result.get("ok"))
+                    )
+                    child_summary = tool_result.get("child_response_summary") or ""
+                    if not child_summary and isinstance(tool_result.get("result"), dict):
+                        child_summary = str(tool_result["result"].get("response", ""))[:300]
+                    record["child_response_summary"] = child_summary
+                tool_call_records.append(record)
 
                 # Append tool result message
                 messages.append({

@@ -641,15 +641,16 @@ class TestHealthEndpoints:
         except Exception as exc:
             pytest.skip(f"Could not import main.py for health endpoint tests: {exc}")
 
-    # [P1] [C15 — Interface] [POSITIVE] — /health/browser returns browser_installed key
+    # [P1] [C15 — Interface] [POSITIVE] — /health/browser returns chromium_installed key
     def test_health_browser_endpoint_returns_browser_installed_key(self, client):
         resp = client.get("/health/browser")
         assert resp.status_code == 200, (
             f"Expected /health/browser HTTP 200, got {resp.status_code}."
         )
         data = resp.json()
-        assert "browser_installed" in data, (
-            f"Expected 'browser_installed' key in /health/browser response. "
+        # Endpoint was updated to return chromium_installed (more specific than browser_installed)
+        assert "chromium_installed" in data, (
+            f"Expected 'chromium_installed' key in /health/browser response. "
             f"Actual keys returned: {list(data.keys())}."
         )
 

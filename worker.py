@@ -147,9 +147,16 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
                 _artifact_upload_ok = False
                 log.exception("artifact upload failed for job %s — marking DELIVERED_WITH_ARTIFACT_WARNING", job_id)
             _delivery_status = "DELIVERED" if _artifact_upload_ok else "DELIVERED_WITH_ARTIFACT_WARNING"
+            # Pack response + trace into resultSummary so poll clients can inspect tool calls.
+            _response_text = str(result.get("response", ""))
+            _trace = result.get("trace", {})
+            _result_payload = json.dumps({
+                "response": _response_text[:1800],
+                "trace": _trace,
+            })[:4000]
             update_job_status(
                 job_id, _delivery_status,
-                result_summary=str(result.get("response", ""))[:4000],
+                result_summary=_result_payload,
                 output_artifact_uris=artifact_uris if artifact_uris else None,
             )
             log.info("job %s %s", job_id, _delivery_status)

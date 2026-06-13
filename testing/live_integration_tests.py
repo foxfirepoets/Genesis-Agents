@@ -280,9 +280,16 @@ def test_meta_delegation() -> bool:
 
     print(f"  Response ok: {inner.get('ok')}")
     trace = inner.get("trace", {})
-    tool_calls_count = trace.get("tool_calls", 0)
+    tc_raw = trace.get("tool_calls", 0)
+    # tool_calls may be a list (new structured format) or int (legacy)
+    if isinstance(tc_raw, list):
+        tool_calls_count = len(tc_raw)
+        tool_call_names = [t.get("tool_name", "") for t in tc_raw]
+    else:
+        tool_calls_count = int(tc_raw) if tc_raw else 0
+        tool_call_names = []
     response_text = str(inner.get("response", ""))[:120]
-    print(f"  trace.tool_calls (turn count): {tool_calls_count}")
+    print(f"  trace.tool_calls: {tool_calls_count} entries, names={tool_call_names}")
     print(f"  response snippet: {response_text}")
 
     # Check response contains evidence of delegation
@@ -290,6 +297,7 @@ def test_meta_delegation() -> bool:
         "genesis_call" in response_text.lower()
         or "genesis-research" in response_text.lower()
         or tool_calls_count > 1
+        or "genesis_call" in tool_call_names
     )
 
     if inner.get("ok") and has_delegation_evidence:
@@ -423,6 +431,171 @@ def test_render_async_job() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Test: meta_real_orchestration — trace-proven genesis_call tool invocations
+# ---------------------------------------------------------------------------
+
+def test_meta_real_orchestration() -> bool:
+    """Submit genesis-meta via the real async runtime (no live_test bypass), wait for DELIVERED,
+    then verify trace.tool_calls contains structured genesis_call entries with child_job_id,
+    child_ok, and target_agent_slug. Fails if tool_calls is empty or contains no genesis_call."""
+    print("\n[TEST meta_real_orchestration] Meta real tool-call orchestration — trace proof required")
+
+    if not GATEWAY_API_KEY and not AGENT_GATEWAY_SECRET:
+        print(f"  {SKIP} meta_real_orchestration: auth not set — cannot run")
+        return False
+
+    import urllib.request
+
+    def _post(path: str, payload: dict) -> dict:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{RENDER_URL}{path}",
+            data=data,
+            headers={"Content-Type": "application/json", **_auth_headers()},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def _get(path: str) -> dict:
+        req = urllib.request.Request(
+            f"{RENDER_URL}{path}",
+            headers=_auth_headers(),
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
+    # Submit to genesis-meta WITHOUT mode:live_test so the full AgentRuntime path runs.
+    # The prompt explicitly instructs Meta to call genesis_call twice.
+    try:
+        submit_resp = _post("/agents/genesis-meta/run", {
+            "task": (
+                "You MUST use the genesis_call tool to delegate. Do not just describe — call the tool now.\n"
+                "Step 1: Call genesis_call with agent='genesis-research' and task='What year was Python created? Answer in one sentence.'.\n"
+                "Step 2: Call genesis_call with agent='genesis-finance' and task='What is 10 divided by 2? Answer with just the number.'.\n"
+                "Step 3: After both calls complete, write a one-paragraph Delegation Summary listing which agents you called and what each returned."
+            ),
+            "params": {},
+        })
+    except Exception as e:
+        print(f"  {FAIL} Submit request failed: {e}")
+        return False
+
+    print(f"  Submit response: {str(submit_resp)[:300]}")
+
+    # genesis-meta is async — parse job_id from the response
+    raw_resp_str = submit_resp.get("response", "")
+    try:
+        job_info = json.loads(raw_resp_str) if isinstance(raw_resp_str, str) else {}
+    except json.JSONDecodeError:
+        job_info = {}
+
+    job_id = job_info.get("job_id") or submit_resp.get("job_id")
+    if not job_id:
+        print(f"  {FAIL} No job_id in submit response: {submit_resp}")
+        return False
+
+    print(f"  Queued job_id: {job_id}")
+    poll_path = f"/agents/jobs/{job_id}"
+
+    # Trigger worker tick so the job actually runs
+    if RENDER_INTERNAL_SECRET:
+        try:
+            time.sleep(2)
+            tick_req = urllib.request.Request(
+                f"{RENDER_URL}/internal/genesis-worker/tick",
+                data=json.dumps({"limit": 1}).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Internal-Secret": RENDER_INTERNAL_SECRET,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(tick_req, timeout=30) as r:
+                tick_resp = json.loads(r.read())
+            print(f"  Worker tick: {tick_resp}")
+        except Exception as e:
+            print(f"  Worker tick failed (non-fatal): {e}")
+    else:
+        print("  RENDER_INTERNAL_SECRET not set — job will run via background worker polling")
+
+    # Poll up to 5 minutes — Meta orchestration takes longer than simple agents
+    deadline = time.time() + 300
+    last_status = "UNKNOWN"
+    while time.time() < deadline:
+        time.sleep(8)
+        try:
+            status_resp = _get(poll_path)
+        except Exception as e:
+            print(f"  poll error: {e}")
+            continue
+
+        last_status = status_resp.get("status", "UNKNOWN")
+        print(f"  [{time.strftime('%H:%M:%S')}] status={last_status}")
+
+        if last_status in ("DELIVERED", "DELIVERED_WITH_ARTIFACT_WARNING"):
+            break
+        elif last_status == "FAILED":
+            print(f"  {FAIL} Job FAILED: {status_resp.get('errorCode')} — {status_resp.get('errorMessage', '')[:300]}")
+            return False
+    else:
+        print(f"  {FAIL} Job did not reach DELIVERED within 300s. Last status: {last_status}")
+        return False
+
+    print(f"  {PASS} Job reached {last_status}")
+
+    # Parse resultSummary — worker now packs {response, trace} as JSON
+    raw_summary = status_resp.get("resultSummary", "")
+    trace = {}
+    try:
+        parsed = json.loads(raw_summary)
+        if isinstance(parsed, dict):
+            trace = parsed.get("trace", {})
+            print(f"  response snippet: {str(parsed.get('response', ''))[:120]}")
+    except (json.JSONDecodeError, TypeError):
+        print(f"  resultSummary is not JSON (legacy format): {raw_summary[:100]}")
+
+    tool_calls = trace.get("tool_calls", [])
+    if not isinstance(tool_calls, list):
+        print(f"  {FAIL} trace.tool_calls is not a list: {type(tool_calls).__name__} = {tool_calls!r}")
+        return False
+
+    print(f"  trace.tool_calls count: {len(tool_calls)}")
+    for i, tc in enumerate(tool_calls):
+        print(f"    [{i}] tool={tc.get('tool_name')} target={tc.get('target_agent_slug')} child_job={tc.get('child_job_id')} child_ok={tc.get('child_ok')}")
+
+    genesis_calls = [t for t in tool_calls if t.get("tool_name") == "genesis_call"]
+    if len(genesis_calls) < 2:
+        print(f"  {FAIL} Expected >= 2 genesis_call entries in trace, got {len(genesis_calls)}")
+        print(f"         Full tool_calls: {json.dumps(tool_calls)[:600]}")
+        if not tool_calls:
+            print("         DIAGNOSIS: trace.tool_calls is empty — either Meta did not call genesis_call,")
+            print("         or the resultSummary was not in JSON format. Check worker.py result packing.")
+        return False
+
+    # Validate each genesis_call entry
+    problems = []
+    for i, gc in enumerate(genesis_calls):
+        if not gc.get("target_agent_slug"):
+            problems.append(f"genesis_call[{i}] missing target_agent_slug")
+        if not gc.get("child_job_id"):
+            problems.append(f"genesis_call[{i}] missing child_job_id")
+        if gc.get("child_ok") is not True:
+            problems.append(f"genesis_call[{i}] child_ok={gc.get('child_ok')} (expected True)")
+
+    if problems:
+        print(f"  {FAIL} genesis_call trace entries have problems:")
+        for p in problems:
+            print(f"         - {p}")
+        return False
+
+    agents_called = [gc.get("target_agent_slug") for gc in genesis_calls]
+    print(f"  {PASS} Trace-proven genesis_call delegations: {agents_called}")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Test 6: Conduit browser job — noted as requires live Render + Chromium
 # ---------------------------------------------------------------------------
 
@@ -446,6 +619,7 @@ TESTS = {
     "postgres_lifecycle": test_postgres_lifecycle,
     "artifact_failure": test_artifact_failure,
     "meta_delegation": test_meta_delegation,
+    "meta_real_orchestration": test_meta_real_orchestration,
     "render_async_job": test_render_async_job,
     "conduit_browser": test_conduit_browser,
 }
