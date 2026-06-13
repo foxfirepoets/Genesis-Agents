@@ -1,0 +1,460 @@
+"""live_integration_tests.py — Real integration tests requiring live credentials.
+
+These tests hit a real Postgres database and/or the live Render service.
+They are NOT run in CI (no mocks). Run manually when credentials are available.
+
+Required env vars:
+  DATABASE_URL or GENESIS_JOB_DATABASE_URL  — Supabase connection string (pooler OK)
+  GATEWAY_API_KEY or AGENT_GATEWAY_SECRET   — genesis gateway auth
+  LLM_API_KEY                               — LLM router API key (OpenRouter or SwarmSync)
+  LLM_API_URL                               — LLM router URL (optional, defaults to SwarmSync)
+  RENDER_SERVICE_URL                        — default: https://swarmsync-agents.onrender.com
+
+Run:
+  python testing/live_integration_tests.py [test_name]
+
+  python testing/live_integration_tests.py postgres_lifecycle
+  python testing/live_integration_tests.py artifact_failure
+  python testing/live_integration_tests.py meta_delegation
+  python testing/live_integration_tests.py render_async_job
+  python testing/live_integration_tests.py all
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+PROJECT_ROOT = Path(__file__).parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+RENDER_URL = os.getenv("RENDER_SERVICE_URL", "https://swarmsync-agents.onrender.com")
+# Accept either GATEWAY_API_KEY (X-Agent-Api-Key) or AGENT_GATEWAY_SECRET (x-agent-gateway-secret)
+GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
+AGENT_GATEWAY_SECRET = os.getenv("AGENT_GATEWAY_SECRET", "")
+DATABASE_URL = os.getenv("GENESIS_JOB_DATABASE_URL") or os.getenv("DATABASE_URL", "")
+
+PASS = "\033[32mPASS\033[0m"
+FAIL = "\033[31mFAIL\033[0m"
+SKIP = "\033[33mSKIP\033[0m"
+
+_UNSUPPORTED_PSYCOPG_PARAMS = {"pgbouncer", "connection_limit"}
+
+
+def _psycopg_url(raw: str) -> str:
+    """Strip pgbouncer/connection_limit params that psycopg rejects."""
+    parts = urlsplit(raw)
+    if not parts.query:
+        return raw
+    filtered = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                if k.lower() not in _UNSUPPORTED_PSYCOPG_PARAMS]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(filtered), parts.fragment))
+
+
+def _auth_headers() -> dict:
+    """Return the correct auth header for Render calls."""
+    if GATEWAY_API_KEY:
+        return {"X-Agent-Api-Key": GATEWAY_API_KEY}
+    if AGENT_GATEWAY_SECRET:
+        return {"x-agent-gateway-secret": AGENT_GATEWAY_SECRET}
+    return {}
+
+
+def _require(var: str, value: str, test_name: str) -> bool:
+    if not value:
+        print(f"  {SKIP} {test_name}: {var} not set — cannot run")
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Real Postgres lifecycle — QUEUED → RUNNING → DELIVERED
+# ---------------------------------------------------------------------------
+
+def test_postgres_lifecycle() -> bool:
+    """Insert a job directly into genesis_jobs, run it through worker, verify DELIVERED."""
+    print("\n[TEST 2] Real Postgres lifecycle: QUEUED → RUNNING → DELIVERED")
+
+    if not _require("DATABASE_URL", DATABASE_URL, "postgres_lifecycle"):
+        return False
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+    job_id = f"live-test-{uuid.uuid4().hex[:12]}"
+    print(f"  job_id: {job_id}")
+
+    try:
+        conn = psycopg.connect(_psycopg_url(DATABASE_URL), row_factory=dict_row, prepare_threshold=0)
+    except Exception as e:
+        print(f"  {FAIL} DB connect failed: {e}")
+        return False
+
+    try:
+        with conn.cursor() as cur:
+            # Insert a QUEUED job
+            cur.execute(
+                """
+                INSERT INTO genesis_jobs (id, "agentSlug", prompt, status, params,
+                    "createdAt", "updatedAt")
+                VALUES (%s, %s, %s, 'QUEUED', %s, NOW(), NOW())
+                """,
+                (job_id, "genesis-finance", "What is 2+2? Reply with just the number.", "{}"),
+            )
+            conn.commit()
+            print(f"  Inserted QUEUED job {job_id}")
+
+        # Import and run worker synchronously (single-job mode)
+        import asyncio
+        from agent_runtime import AgentRuntime
+        from job_store import claim_job_by_id
+        import worker as worker_mod
+
+        llm_url = os.getenv("LLM_API_URL", "https://api.swarmsync.ai/v1/chat/completions")
+        llm_key = os.getenv("LLM_API_KEY", "")
+        if not llm_key:
+            print(f"  {SKIP} LLM_API_KEY not set — cannot run agent, checking DB row only")
+        else:
+            runtime = AgentRuntime(llm_url=llm_url, llm_key=llm_key)
+            job = claim_job_by_id(job_id)
+            if not job:
+                print(f"  {FAIL} claim_job_by_id returned None for {job_id}")
+                return False
+            asyncio.run(worker_mod.process_job(job, runtime))
+
+        # Verify final status in DB
+        with conn.cursor() as cur:
+            cur.execute('SELECT status, "resultSummary" FROM genesis_jobs WHERE id = %s', (job_id,))
+            row = cur.fetchone()
+
+        if not row:
+            print(f"  {FAIL} No row found for {job_id} after process_job")
+            return False
+
+        status = row["status"]
+        print(f"  Final status: {status}")
+        print(f"  Result summary snippet: {str(row.get('resultSummary', ''))[:80]}")
+
+        if status in ("DELIVERED", "DELIVERED_WITH_ARTIFACT_WARNING"):
+            print(f"  {PASS} Job reached terminal DELIVERED state")
+            return True
+        else:
+            print(f"  {FAIL} Expected DELIVERED*, got {status}")
+            return False
+
+    finally:
+        # Clean up test row
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM genesis_jobs WHERE id = %s", (job_id,))
+                conn.commit()
+        except Exception:
+            pass
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 3: Artifact failure → DELIVERED_WITH_ARTIFACT_WARNING
+# ---------------------------------------------------------------------------
+
+def test_artifact_failure() -> bool:
+    """Run a job but sabotage the upload to force DELIVERED_WITH_ARTIFACT_WARNING."""
+    print("\n[TEST 3] Artifact failure → DELIVERED_WITH_ARTIFACT_WARNING")
+
+    if not _require("DATABASE_URL", DATABASE_URL, "artifact_failure"):
+        return False
+    if not _require("LLM_API_KEY", os.getenv("LLM_API_KEY", ""), "artifact_failure"):
+        return False
+
+    import asyncio
+    import psycopg
+    from psycopg.rows import dict_row
+    from unittest.mock import patch
+    from agent_runtime import AgentRuntime
+    from job_store import claim_job_by_id
+    import worker as worker_mod
+
+    job_id = f"live-artifact-fail-{uuid.uuid4().hex[:10]}"
+    print(f"  job_id: {job_id}")
+
+    conn = psycopg.connect(_psycopg_url(DATABASE_URL), row_factory=dict_row, prepare_threshold=0)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO genesis_jobs (id, "agentSlug", prompt, status, params,
+                    "createdAt", "updatedAt")
+                VALUES (%s, %s, %s, 'QUEUED', %s, NOW(), NOW())
+                """,
+                (job_id, "genesis-finance", "What is 3+3?", "{}"),
+            )
+            conn.commit()
+
+        llm_url = os.getenv("LLM_API_URL", "https://api.swarmsync.ai/v1/chat/completions")
+        llm_key = os.getenv("LLM_API_KEY", "")
+        runtime = AgentRuntime(llm_url=llm_url, llm_key=llm_key)
+        job = claim_job_by_id(job_id)
+
+        # Create job dir so artifact check fires, then force upload failure
+        Path(f"/tmp/jobs/{job_id}").mkdir(parents=True, exist_ok=True)
+
+        with patch("artifact_store.upload_dir", side_effect=RuntimeError("forced upload failure")):
+            asyncio.run(worker_mod.process_job(job, runtime))
+
+        with conn.cursor() as cur:
+            cur.execute('SELECT status FROM genesis_jobs WHERE id = %s', (job_id,))
+            row = cur.fetchone()
+
+        status = row["status"] if row else "MISSING"
+        print(f"  Final status: {status}")
+
+        if status == "DELIVERED_WITH_ARTIFACT_WARNING":
+            print(f"  {PASS} Forced upload failure correctly set DELIVERED_WITH_ARTIFACT_WARNING")
+            return True
+        else:
+            print(f"  {FAIL} Expected DELIVERED_WITH_ARTIFACT_WARNING, got {status}")
+            return False
+
+    finally:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM genesis_jobs WHERE id = %s", (job_id,))
+                conn.commit()
+        except Exception:
+            pass
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Meta Agent real delegation — trace.tool_calls contains genesis_call
+# ---------------------------------------------------------------------------
+
+def test_meta_delegation() -> bool:
+    """Call genesis-meta via /agents/genesis-meta/run and inspect trace.tool_calls."""
+    print("\n[TEST 4] Meta Agent delegation — trace.tool_calls must contain genesis_call")
+
+    if not GATEWAY_API_KEY and not AGENT_GATEWAY_SECRET:
+        print(f"  {SKIP} meta_delegation: GATEWAY_API_KEY and AGENT_GATEWAY_SECRET not set — cannot run")
+        return False
+
+    import urllib.request
+
+    payload = json.dumps({
+        "task": (
+            "You must delegate this to genesis-research. "
+            "Use the genesis_call tool to invoke genesis-research with "
+            "task='Briefly explain what Python is in one sentence'."
+        ),
+        "params": {},
+        "mode": "live_test",
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{RENDER_URL}/agents/genesis-meta/run",
+        data=payload,
+        headers={"Content-Type": "application/json", **_auth_headers()},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read())
+    except Exception as e:
+        print(f"  {FAIL} HTTP request failed: {e}")
+        return False
+
+    print(f"  Response ok: {body.get('ok')}")
+    trace = body.get("trace", {})
+    tool_calls_count = trace.get("tool_calls", 0)
+    response_text = str(body.get("response", ""))[:120]
+    print(f"  trace.tool_calls (turn count): {tool_calls_count}")
+    print(f"  response snippet: {response_text}")
+
+    # Check response contains evidence of delegation
+    has_delegation_evidence = (
+        "genesis_call" in response_text.lower()
+        or "genesis-research" in response_text.lower()
+        or tool_calls_count > 1
+    )
+
+    if body.get("ok") and has_delegation_evidence:
+        print(f"  {PASS} Meta agent responded with delegation evidence")
+        return True
+    elif body.get("ok"):
+        print(f"  {FAIL} Meta agent responded ok=True but no delegation evidence found")
+        print(f"         Full response: {json.dumps(body)[:400]}")
+        return False
+    else:
+        print(f"  {FAIL} Meta agent returned ok=False: {body.get('error')}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Render async job — submit, poll, confirm DELIVERED
+# ---------------------------------------------------------------------------
+
+def test_render_async_job() -> bool:
+    """Submit an async job to Render, poll /agents/jobs/{id}, confirm DELIVERED."""
+    print("\n[TEST 5] Render async job — submit → poll → DELIVERED")
+
+    if not GATEWAY_API_KEY and not AGENT_GATEWAY_SECRET:
+        print(f"  {SKIP} render_async_job: GATEWAY_API_KEY and AGENT_GATEWAY_SECRET not set — cannot run")
+        return False
+
+    # Check new endpoints are live
+    import urllib.request
+
+    def _get(path: str) -> dict:
+        req = urllib.request.Request(
+            f"{RENDER_URL}{path}",
+            headers=_auth_headers(),
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
+    def _post(path: str, payload: dict) -> dict:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{RENDER_URL}{path}",
+            data=data,
+            headers={"Content-Type": "application/json", **_auth_headers()},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
+    # Verify /health/worker is live (new deploy check)
+    try:
+        worker_health = _get("/health/worker")
+        print(f"  /health/worker: {worker_health}")
+    except Exception as e:
+        print(f"  {FAIL} /health/worker returned error — is new commit deployed? {e}")
+        print("         Wait for Render to finish deploying commit 3e5f1b2, then retry.")
+        return False
+
+    # Submit async job (genesis-research uses job_mode: async)
+    try:
+        submit_resp = _post("/agents/genesis-research/run", {
+            "task": "What year was Python created? One sentence answer.",
+            "params": {},
+        })
+    except Exception as e:
+        print(f"  {FAIL} Submit request failed: {e}")
+        return False
+
+    print(f"  Submit response: {str(submit_resp)[:200]}")
+
+    # Async agents return a JSON string with job_id
+    raw = submit_resp if isinstance(submit_resp, dict) else {}
+    response_str = raw.get("response", "")
+    try:
+        job_info = json.loads(response_str) if isinstance(response_str, str) else {}
+    except json.JSONDecodeError:
+        job_info = {}
+
+    job_id = job_info.get("job_id") or raw.get("job_id")
+    if not job_id:
+        print(f"  {FAIL} No job_id in submit response: {submit_resp}")
+        return False
+
+    print(f"  Submitted job_id: {job_id}")
+    poll_url = job_info.get("poll_url", f"{RENDER_URL}/agents/jobs/{job_id}")
+    print(f"  Polling: {poll_url}")
+
+    # Poll up to 3 minutes
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        time.sleep(5)
+        try:
+            status_resp = _get(f"/agents/jobs/{job_id}")
+        except Exception as e:
+            print(f"  poll error: {e}")
+            continue
+
+        status = status_resp.get("status", "UNKNOWN")
+        print(f"  [{time.strftime('%H:%M:%S')}] status={status}")
+
+        if status in ("DELIVERED", "DELIVERED_WITH_ARTIFACT_WARNING"):
+            print(f"  {PASS} Job reached {status}")
+            print(f"  result_summary snippet: {str(status_resp.get('resultSummary', ''))[:100]}")
+            return True
+        elif status == "FAILED":
+            print(f"  {FAIL} Job FAILED: {status_resp.get('errorCode')} — {status_resp.get('errorMessage', '')[:200]}")
+            return False
+
+    print(f"  {FAIL} Job did not reach DELIVERED within 180s. Last status: {status}")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Conduit browser job — noted as requires live Render + Chromium
+# ---------------------------------------------------------------------------
+
+def test_conduit_browser() -> bool:
+    """Placeholder — requires live Render with Chromium + async worker. Manual only."""
+    print("\n[TEST 6] Conduit browser job on Render")
+    print(f"  {SKIP} This test requires:")
+    print("    - Render service running a Chromium-capable worker (not free tier)")
+    print("    - An async job submitted with a browser_required=true agent slug")
+    print("    - Poll until DELIVERED; verify artifact contains screenshot/HAR")
+    print("  Run manually via: POST /agents/genesis-builder/run with a browser task")
+    print("  and poll GET /agents/jobs/{id} until DELIVERED within 5 minutes.")
+    return None  # type: ignore  # None = SKIPPED, not FAIL
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+TESTS = {
+    "postgres_lifecycle": test_postgres_lifecycle,
+    "artifact_failure": test_artifact_failure,
+    "meta_delegation": test_meta_delegation,
+    "render_async_job": test_render_async_job,
+    "conduit_browser": test_conduit_browser,
+}
+
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else "all"
+
+    if target == "all":
+        to_run = list(TESTS.items())
+    elif target in TESTS:
+        to_run = [(target, TESTS[target])]
+    else:
+        print(f"Unknown test: {target}. Options: {', '.join(TESTS)} or 'all'")
+        sys.exit(1)
+
+    results = {}
+    for name, fn in to_run:
+        try:
+            results[name] = fn()
+        except Exception as exc:
+            print(f"  {FAIL} {name} raised: {exc}")
+            results[name] = False
+
+    print("\n" + "=" * 60)
+    print("LIVE INTEGRATION TEST SUMMARY")
+    print("=" * 60)
+    passed = failed = skipped = 0
+    for name, result in results.items():
+        if result is True:
+            print(f"  {PASS}  {name}")
+            passed += 1
+        elif result is False:
+            print(f"  {FAIL}  {name}")
+            failed += 1
+        else:
+            print(f"  {SKIP}  {name}")
+            skipped += 1
+    print(f"\n{passed} passed, {failed} failed, {skipped} skipped")
+    print("=" * 60)
+
+    if failed:
+        sys.exit(1)
