@@ -49,7 +49,7 @@ def _conn():
     db_url = _database_url()
     if not db_url:
         raise RuntimeError("DATABASE_URL not configured")
-    return psycopg.connect(db_url, row_factory=dict_row, prepare_threshold=0)
+    return psycopg.connect(db_url, row_factory=dict_row, prepare_threshold=None)
 
 
 def _gen_id() -> str:

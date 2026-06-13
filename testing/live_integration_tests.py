@@ -38,6 +38,7 @@ RENDER_URL = os.getenv("RENDER_SERVICE_URL", "https://swarmsync-agents.onrender.
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
 AGENT_GATEWAY_SECRET = os.getenv("AGENT_GATEWAY_SECRET", "")
 DATABASE_URL = os.getenv("GENESIS_JOB_DATABASE_URL") or os.getenv("DATABASE_URL", "")
+RENDER_INTERNAL_SECRET = os.getenv("RENDER_INTERNAL_SECRET", "")
 
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
@@ -90,7 +91,7 @@ def test_postgres_lifecycle() -> bool:
     print(f"  job_id: {job_id}")
 
     try:
-        conn = psycopg.connect(_psycopg_url(DATABASE_URL), row_factory=dict_row, prepare_threshold=0)
+        conn = psycopg.connect(_psycopg_url(DATABASE_URL), row_factory=dict_row, prepare_threshold=None)
     except Exception as e:
         print(f"  {FAIL} DB connect failed: {e}")
         return False
@@ -182,7 +183,7 @@ def test_artifact_failure() -> bool:
     job_id = f"live-artifact-fail-{uuid.uuid4().hex[:10]}"
     print(f"  job_id: {job_id}")
 
-    conn = psycopg.connect(_psycopg_url(DATABASE_URL), row_factory=dict_row, prepare_threshold=0)
+    conn = psycopg.connect(_psycopg_url(DATABASE_URL), row_factory=dict_row, prepare_threshold=None)
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -268,10 +269,19 @@ def test_meta_delegation() -> bool:
         print(f"  {FAIL} HTTP request failed: {e}")
         return False
 
-    print(f"  Response ok: {body.get('ok')}")
-    trace = body.get("trace", {})
+    # /agents/{slug}/run returns RunResponse: {"response": "<json-string>", "agentSlug": ...}
+    # Parse the inner JSON to get ok, trace, etc.
+    inner = body
+    if isinstance(body.get("response"), str):
+        try:
+            inner = json.loads(body["response"])
+        except json.JSONDecodeError:
+            inner = body
+
+    print(f"  Response ok: {inner.get('ok')}")
+    trace = inner.get("trace", {})
     tool_calls_count = trace.get("tool_calls", 0)
-    response_text = str(body.get("response", ""))[:120]
+    response_text = str(inner.get("response", ""))[:120]
     print(f"  trace.tool_calls (turn count): {tool_calls_count}")
     print(f"  response snippet: {response_text}")
 
@@ -282,15 +292,16 @@ def test_meta_delegation() -> bool:
         or tool_calls_count > 1
     )
 
-    if body.get("ok") and has_delegation_evidence:
+    if inner.get("ok") and has_delegation_evidence:
         print(f"  {PASS} Meta agent responded with delegation evidence")
         return True
-    elif body.get("ok"):
+    elif inner.get("ok"):
         print(f"  {FAIL} Meta agent responded ok=True but no delegation evidence found")
-        print(f"         Full response: {json.dumps(body)[:400]}")
+        print(f"         Full response: {json.dumps(inner)[:400]}")
         return False
     else:
-        print(f"  {FAIL} Meta agent returned ok=False: {body.get('error')}")
+        print(f"  {FAIL} Meta agent returned ok=False: {inner.get('error')}")
+        print(f"         Full body: {json.dumps(body)[:400]}")
         return False
 
 
@@ -366,6 +377,25 @@ def test_render_async_job() -> bool:
     print(f"  Submitted job_id: {job_id}")
     poll_url = job_info.get("poll_url", f"{RENDER_URL}/agents/jobs/{job_id}")
     print(f"  Polling: {poll_url}")
+
+    # If RENDER_INTERNAL_SECRET is set, trigger the worker tick so the job runs
+    if RENDER_INTERNAL_SECRET:
+        try:
+            time.sleep(2)
+            tick_req = urllib.request.Request(
+                f"{RENDER_URL}/internal/genesis-worker/tick",
+                data=json.dumps({"limit": 3}).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Internal-Secret": RENDER_INTERNAL_SECRET,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(tick_req, timeout=20) as r:
+                tick_resp = json.loads(r.read())
+            print(f"  Worker tick triggered: {tick_resp}")
+        except Exception as e:
+            print(f"  Worker tick failed (non-fatal): {e}")
 
     # Poll up to 3 minutes
     deadline = time.time() + 180
