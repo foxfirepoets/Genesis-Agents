@@ -14,8 +14,14 @@
     "conduit"
   ],
   "tool_methods_from_source": [
-    { "name": "prepare_deployment_files", "docstring": "Prepare code files for deployment" },
-    { "name": "push_to_github", "docstring": "Push code to GitHub repository" },
+    {
+      "name": "prepare_deployment_files",
+      "docstring": "Prepare code files for deployment"
+    },
+    {
+      "name": "push_to_github",
+      "docstring": "Push code to GitHub repository"
+    },
     {
       "name": "deploy_to_vercel",
       "docstring": "Deploy to Vercel using REST API or browser automation fallback"
@@ -36,8 +42,14 @@
       "name": "configure_cdn",
       "docstring": "Request AP2 approval for CDN subscriptions (Cloudflare, Fastly, etc.)."
     },
-    { "name": "verify_deployment", "docstring": "Verify deployment is live and accessible" },
-    { "name": "rollback_deployment", "docstring": "Rollback deployment to previous version" },
+    {
+      "name": "verify_deployment",
+      "docstring": "Verify deployment is live and accessible"
+    },
+    {
+      "name": "rollback_deployment",
+      "docstring": "Rollback deployment to previous version"
+    },
     {
       "name": "request_infrastructure_budget",
       "docstring": "Request AP2 consent for hosting, CDN, or database upgrades."
@@ -65,5 +77,9 @@
   "conduit_budget_cents": 500,
   "job_mode": "async",
   "price_tier_default_cents": 15000,
-  "absorbed_from": []
+  "absorbed_from": [],
+  "runtime_level": "autonomous_workspace",
+  "tools_verified": true,
+  "artifact_support": true,
+  "browser_required": true
 }

@@ -6,7 +6,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from bundle_loader import load_bundle
 from tools import get_tool, tool_schemas_for, register_default_tools
@@ -82,13 +82,13 @@ class AgentRuntime:
         self.llm_key = llm_key
         _ensure_tools_registered()
 
-    async def execute_agent(self, slug: str, task: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def execute_agent(self, slug: str, task: str, params: dict[str, Any], *, job_id: Optional[str] = None) -> dict[str, Any]:
         """Execute one agent invocation. Returns structured result."""
         bundle = load_bundle(slug)
         if bundle is None:
             return {"ok": False, "error": "unknown_slug", "slug": slug}
 
-        job_id = f"job-{uuid.uuid4().hex[:12]}"
+        job_id = job_id or f"job-{uuid.uuid4().hex[:12]}"
         job_dir = Path(f"/tmp/jobs/{job_id}")
         job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -288,17 +288,28 @@ class AgentRuntime:
 
             if not tool_calls:
                 # Final answer
+                _finished_at = time.time()
                 result: dict[str, Any] = {
                     "ok": True,
                     "slug": slug,
                     "response": content,
                     "turns": turn,
-                    "elapsed_s": round(time.time() - started, 2),
+                    "elapsed_s": round(_finished_at - started, 2),
                     "job_id": job_id,
                     "resource_usage": {
                         "llm_calls": llm_calls,
                         "total_tokens": total_tokens,
                         "files_written": files_written,
+                    },
+                    "trace": {
+                        "job_id": job_id,
+                        "agent_slug": slug,
+                        "workspace_path": str(job_dir),
+                        "artifact_count": files_written,
+                        "tool_calls": turn,
+                        "started_at": started,
+                        "finished_at": _finished_at,
+                        "status": "ok",
                     },
                 }
                 if last_swarmsync:
@@ -321,6 +332,7 @@ class AgentRuntime:
                 if not criteria_eval["ok"]:
                     result["ok"] = False
                     result["error"] = "success_criteria_failed"
+                result["trace"]["status"] = "ok" if result["ok"] else "failed"
 
                 # Phase 7 — generate VCAP proof bundle if we have a Conduit bridge
                 if bridge is not None:

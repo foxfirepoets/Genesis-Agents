@@ -5,13 +5,30 @@
   "version": "1.0.0",
   "source_file": "Genesis Agents/maintenance_agent.py",
   "system_prompt": "You are a system maintenance and operations specialist. Monitor system health, perform routine maintenance, optimize performance, manage backups, and ensure high availability. Track uptime, resource utilization, database health, and infrastructure costs. Implement proactive monitoring and automated remediation. Use UptimeRobot API for uptime monitoring.",
-  "tools_advertised": ["conduit"],
+  "tools_advertised": [
+    "conduit"
+  ],
   "tool_methods_from_source": [
-    { "name": "check_system_health", "docstring": "Check health status of system components" },
-    { "name": "perform_maintenance", "docstring": "Schedule and perform maintenance tasks" },
-    { "name": "monitor_resources", "docstring": "Monitor system resource utilization" },
-    { "name": "manage_backups", "docstring": "Manage system backups and recovery" },
-    { "name": "generate_uptime_report", "docstring": "Generate uptime and availability report" }
+    {
+      "name": "check_system_health",
+      "docstring": "Check health status of system components"
+    },
+    {
+      "name": "perform_maintenance",
+      "docstring": "Schedule and perform maintenance tasks"
+    },
+    {
+      "name": "monitor_resources",
+      "docstring": "Monitor system resource utilization"
+    },
+    {
+      "name": "manage_backups",
+      "docstring": "Manage system backups and recovery"
+    },
+    {
+      "name": "generate_uptime_report",
+      "docstring": "Generate uptime and availability report"
+    }
   ],
   "output_shape_hint": [
     "health_check_id",
@@ -39,5 +56,9 @@
   "token_budget": 4000,
   "conduit_budget_cents": 100,
   "price_tier_default_cents": 2500,
-  "absorbed_from": []
+  "absorbed_from": [],
+  "runtime_level": "persona_only",
+  "tools_verified": true,
+  "artifact_support": false,
+  "browser_required": true
 }

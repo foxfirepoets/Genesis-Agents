@@ -5,16 +5,34 @@
   "version": "1.0.0",
   "source_file": "Genesis Agents/legal_agent.py",
   "system_prompt": "You are a legal compliance specialist with OCR document scanning capabilities. Generate legal documents, review contracts, ensure regulatory compliance, manage terms of service, privacy policies, and licensing agreements. You can scan and extract text from contract images and legal documents using OCR. Track compliance deadlines, identify legal risks, and maintain document version control. Always recommend human legal review for final approval.",
-  "tools_advertised": ["file_write", "web_fetch", "web_search", "conduit", "vision_ocr"],
+  "tools_advertised": [
+    "file_write",
+    "web_fetch",
+    "web_search",
+    "conduit",
+    "vision_ocr"
+  ],
   "tool_methods_from_source": [
-    { "name": "generate_document", "docstring": "Generate a legal document template" },
-    { "name": "review_contract", "docstring": "Review a contract for legal issues and risks." },
-    { "name": "check_compliance", "docstring": "Check compliance with relevant regulations" },
+    {
+      "name": "generate_document",
+      "docstring": "Generate a legal document template"
+    },
+    {
+      "name": "review_contract",
+      "docstring": "Review a contract for legal issues and risks."
+    },
+    {
+      "name": "check_compliance",
+      "docstring": "Check compliance with relevant regulations"
+    },
     {
       "name": "parse_contract_image",
       "docstring": "Parse contract or legal document images using DeepSeek-OCR compression"
     },
-    { "name": "create_privacy_policy", "docstring": "Create a privacy policy document" },
+    {
+      "name": "create_privacy_policy",
+      "docstring": "Create a privacy policy document"
+    },
     {
       "name": "track_legal_deadlines",
       "docstring": "Track upcoming legal and compliance deadlines"
@@ -50,5 +68,9 @@
   "token_budget": 8000,
   "conduit_budget_cents": 200,
   "price_tier_default_cents": 8000,
-  "absorbed_from": []
+  "absorbed_from": [],
+  "runtime_level": "skill_bundle",
+  "tools_verified": true,
+  "artifact_support": true,
+  "browser_required": true
 }

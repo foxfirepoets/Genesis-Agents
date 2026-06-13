@@ -5,14 +5,37 @@
   "version": "1.0.0",
   "source_file": "Genesis Agents/content_agent.py",
   "system_prompt": "You are an expert content writer specializing in technical documentation and blog posts. Create engaging, SEO-optimized content. For tasks requiring web-based content research (competitor content analysis, trend monitoring, social media research), use the web_content_research tool which employs a multimodal web agent with 59.1% success rate to navigate real websites and extract content.",
-  "tools_advertised": ["file_write", "web_search", "web_fetch", "conduit"],
+  "tools_advertised": [
+    "file_write",
+    "web_search",
+    "web_fetch",
+    "conduit"
+  ],
   "tool_methods_from_source": [
-    { "name": "write_blog_post", "docstring": "Generate blog post outline with SEO optimization." },
-    { "name": "create_documentation", "docstring": "Generate technical documentation structure" },
-    { "name": "generate_faq", "docstring": "Generate FAQ questions and answers" },
-    { "name": "create_video_content", "docstring": "Generate video content storyboard" },
-    { "name": "translate_content", "docstring": "Translate content with AP2 approval" },
-    { "name": "proofread_content", "docstring": "Proofread content with AP2 approval" },
+    {
+      "name": "write_blog_post",
+      "docstring": "Generate blog post outline with SEO optimization."
+    },
+    {
+      "name": "create_documentation",
+      "docstring": "Generate technical documentation structure"
+    },
+    {
+      "name": "generate_faq",
+      "docstring": "Generate FAQ questions and answers"
+    },
+    {
+      "name": "create_video_content",
+      "docstring": "Generate video content storyboard"
+    },
+    {
+      "name": "translate_content",
+      "docstring": "Translate content with AP2 approval"
+    },
+    {
+      "name": "proofread_content",
+      "docstring": "Proofread content with AP2 approval"
+    },
     {
       "name": "subscribe_stock_images",
       "docstring": "Subscribe to stock image provider with AP2 approval"
@@ -67,5 +90,9 @@
   "token_budget": 4000,
   "conduit_budget_cents": 100,
   "price_tier_default_cents": 3500,
-  "absorbed_from": []
+  "absorbed_from": [],
+  "runtime_level": "skill_bundle",
+  "tools_verified": true,
+  "artifact_support": true,
+  "browser_required": true
 }

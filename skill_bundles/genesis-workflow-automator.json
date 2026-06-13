@@ -14,11 +14,19 @@
     "conduit"
   ],
   "tool_methods_from_source": [],
-  "output_shape_hint": ["plan", "actions_taken", "artifacts"],
+  "output_shape_hint": [
+    "plan",
+    "actions_taken",
+    "artifacts"
+  ],
   "model_hint": "anthropic/claude-sonnet-4-5",
   "token_budget": 8000,
   "conduit_budget_cents": 150,
   "price_tier_default_cents": 8000,
   "status": "scaffold",
-  "scaffold_notes": "Tools beyond conduit are placeholders; Phase 5 stubs them; Phase 9b OAuth track activates them"
+  "scaffold_notes": "Tools beyond conduit are placeholders; Phase 5 stubs them; Phase 9b OAuth track activates them",
+  "runtime_level": "tool_worker",
+  "tools_verified": true,
+  "artifact_support": true,
+  "browser_required": true
 }

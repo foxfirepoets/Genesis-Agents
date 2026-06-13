@@ -18,6 +18,16 @@ CALLBACK_MAX_ATTEMPTS = int(os.getenv("WORKER_CALLBACK_MAX_ATTEMPTS", "3"))
 
 _shutdown = False
 
+# Worker state for /health/worker endpoint
+_worker_state: dict[str, Any] = {
+    "enabled": False,
+    "last_tick_at": None,
+    "last_claimed_job_id": None,
+    "currently_running_job_id": None,
+    "processed_count": 0,
+    "failed_count": 0,
+}
+
 
 async def fire_callback(
     callback_url: str,
@@ -93,6 +103,7 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
     params = job["params"] or {}
 
     log.info("processing job %s (slug=%s)", job_id, slug)
+    _worker_state["currently_running_job_id"] = job_id
 
     # Heartbeat coroutine
     async def hb_loop():
@@ -114,15 +125,38 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
     final_error: str | None = None
 
     try:
-        result = await runtime.execute_agent(slug, prompt, params)
+        result = await runtime.execute_agent(slug, prompt, params, job_id=job_id)
         if result.get("ok"):
+            artifact_uris: list[str] = []
+            _artifact_upload_ok = True
+            try:
+                from pathlib import Path
+                from artifact_store import upload_dir
+                job_artifact_dir = Path(f"/tmp/jobs/{job_id}")
+                if job_artifact_dir.exists():
+                    upload_result = upload_dir(job_id=job_id, local_dir=job_artifact_dir)
+                    if upload_result.get("ok"):
+                        artifact_uris = [
+                            f.get("signed_url") or f.get("uri", "")
+                            for f in upload_result.get("files", [])
+                            if f.get("ok")
+                        ]
+                        if artifact_uris:
+                            log.info("job %s uploaded %d artifact(s)", job_id, len(artifact_uris))
+            except Exception:
+                _artifact_upload_ok = False
+                log.exception("artifact upload failed for job %s — marking DELIVERED_WITH_ARTIFACT_WARNING", job_id)
+            _delivery_status = "DELIVERED" if _artifact_upload_ok else "DELIVERED_WITH_ARTIFACT_WARNING"
             update_job_status(
-                job_id, "DELIVERED",
+                job_id, _delivery_status,
                 result_summary=str(result.get("response", ""))[:4000],
+                output_artifact_uris=artifact_uris if artifact_uris else None,
             )
-            log.info("job %s DELIVERED", job_id)
-            final_status = "DELIVERED"
+            log.info("job %s %s", job_id, _delivery_status)
+            final_status = _delivery_status
             final_output = str(result.get("response", ""))
+            _worker_state["processed_count"] += 1
+            _worker_state["last_claimed_job_id"] = job_id
             # Phase 6 — settle the escrow on success, but ONLY when WE own it.
             # When the marketplace owns the escrow (callback_url is set), it
             # settles via its own /billing/escrow/:id/agent-callback handler.
@@ -148,6 +182,7 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
             log.warning("job %s FAILED: %s", job_id, result.get("error"))
             final_status = "FAILED"
             final_error = str(result.get("error", "agent_failure"))
+            _worker_state["failed_count"] += 1
             # Phase 6 — refund the escrow on agent failure, but ONLY when WE own it.
             if escrow_id and not is_external_escrow:
                 try:
@@ -174,6 +209,7 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
         )
         final_status = "FAILED"
         final_error = f"runtime_exception:{type(e).__name__}: {e}"
+        _worker_state["failed_count"] += 1
         # Phase 6 — refund the escrow on runtime exception, but ONLY when WE own it.
         if escrow_id and not is_external_escrow:
             try:
@@ -185,6 +221,7 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
             except Exception:
                 log.exception("escrow release raised for job %s", job_id)
     finally:
+        _worker_state["currently_running_job_id"] = None
         hb_task.cancel()
         try:
             await hb_task
@@ -263,6 +300,7 @@ async def main():
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    _worker_state["enabled"] = True
     runtime = _make_runtime()
 
     sem = asyncio.Semaphore(WORKER_CONCURRENCY)
@@ -289,6 +327,7 @@ async def main():
             slots = WORKER_CONCURRENCY - len(in_flight)
             if slots > 0:
                 jobs = claim_queued_jobs(limit=slots)
+                _worker_state["last_tick_at"] = time.time()
                 for j in jobs:
                     task = asyncio.create_task(process_job(j, runtime))
                     in_flight.add(task)

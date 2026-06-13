@@ -5,11 +5,26 @@
   "version": "1.0.0",
   "source_file": "Genesis Agents/support_agent.py",
   "system_prompt": "You are a customer support specialist with OCR image reading capabilities and issue reproduction via Playwright. Handle support tickets, answer user questions, troubleshoot issues, and escalate complex problems. You can process customer screenshots and error images using OCR, and reproduce customer issues by learning browser automation via self-play. Maintain empathetic, professional communication. Track ticket resolution metrics and identify common issues for documentation. Aim for 84% autonomous resolution rate.",
-  "tools_advertised": ["file_write", "send_email", "web_search", "web_fetch", "conduit"],
+  "tools_advertised": [
+    "file_write",
+    "send_email",
+    "web_search",
+    "web_fetch",
+    "conduit"
+  ],
   "tool_methods_from_source": [
-    { "name": "create_ticket", "docstring": "Create a new support ticket" },
-    { "name": "respond_to_ticket", "docstring": "Respond to a support ticket with a solution." },
-    { "name": "escalate_ticket", "docstring": "Escalate a ticket to a specialized team" },
+    {
+      "name": "create_ticket",
+      "docstring": "Create a new support ticket"
+    },
+    {
+      "name": "respond_to_ticket",
+      "docstring": "Respond to a support ticket with a solution."
+    },
+    {
+      "name": "escalate_ticket",
+      "docstring": "Escalate a ticket to a specialized team"
+    },
     {
       "name": "search_knowledge_base",
       "docstring": "Search the knowledge base for relevant articles"
@@ -77,5 +92,9 @@
   "token_budget": 4000,
   "conduit_budget_cents": 100,
   "price_tier_default_cents": 2000,
-  "absorbed_from": []
+  "absorbed_from": [],
+  "runtime_level": "skill_bundle",
+  "tools_verified": true,
+  "artifact_support": true,
+  "browser_required": true
 }

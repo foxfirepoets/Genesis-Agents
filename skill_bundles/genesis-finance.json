@@ -75,5 +75,9 @@
   "price_tier_default_cents": 7500,
   "absorbed_from": [],
   "is_orchestrator": false,
-  "job_mode": "sync"
+  "job_mode": "sync",
+  "runtime_level": "tool_worker",
+  "tools_verified": true,
+  "artifact_support": true,
+  "browser_required": false
 }

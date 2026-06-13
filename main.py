@@ -1273,6 +1273,164 @@ async def health():
     return {"status": "ok", "service": "swarmsync-agent-gateway"}
 
 
+@app.get("/health/browser")
+async def health_browser():
+    """Report browser/Patchright readiness."""
+    import shutil
+    cache_dir = os.path.expanduser("~/.cache/ms-playwright")
+    chromium_dirs = []
+    browser_installed = False
+    executable_path = None
+
+    if os.path.isdir(cache_dir):
+        for entry in os.scandir(cache_dir):
+            if entry.is_dir() and "chromium" in entry.name.lower():
+                chromium_dirs.append(entry.name)
+                # Look for actual executable
+                for root, dirs, files in os.walk(entry.path):
+                    for fname in files:
+                        if fname in ("chrome", "chromium", "chrome.exe", "chromium.exe", "headless_shell"):
+                            executable_path = os.path.join(root, fname)
+                            browser_installed = True
+                            break
+                    if browser_installed:
+                        break
+
+    conduit_available = False
+    try:
+        import conduit_browser  # noqa: F401
+        conduit_available = True
+    except ImportError:
+        pass
+
+    return {
+        "browser_installed": browser_installed,
+        "executable_path": executable_path,
+        "cache_dir": cache_dir,
+        "chromium_dirs": chromium_dirs,
+        "conduit_available": conduit_available,
+        "note": "browser jobs require paid Render instance with >= 512MB RAM; not available on free tier",
+    }
+
+
+@app.get("/health/worker")
+async def health_worker():
+    """Report Genesis job worker status."""
+    try:
+        from worker import _worker_state
+        state = dict(_worker_state)
+        # Convert timestamp to ISO string if present
+        if state.get("last_tick_at") is not None:
+            import datetime as _dt
+            state["last_tick_at"] = _dt.datetime.fromtimestamp(
+                state["last_tick_at"], tz=_dt.timezone.utc
+            ).isoformat()
+    except Exception:
+        state = {"enabled": False, "error": "worker_module_unavailable"}
+
+    queue_depth = 0
+    stale_count = 0
+    if _JOB_STORE_OK:
+        try:
+            from job_store import _conn
+            with _conn() as conn, conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM genesis_jobs WHERE status = 'QUEUED'")
+                row = cur.fetchone()
+                queue_depth = int(row["n"]) if row else 0
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM genesis_jobs WHERE status = 'RUNNING' "
+                    "AND (\"lastHeartbeatAt\" IS NULL OR \"lastHeartbeatAt\" < NOW() - INTERVAL '5 minutes')"
+                )
+                row = cur.fetchone()
+                stale_count = int(row["n"]) if row else 0
+        except Exception as e:
+            logger.warning("health_worker queue query failed: %s", e)
+
+    return {
+        **state,
+        "queue_depth": queue_depth,
+        "stale_job_count": stale_count,
+        "worker_mode": os.getenv("WORKER_MODE", "trigger_dev"),
+    }
+
+
+@app.get("/agents/jobs/{job_id}/artifacts", dependencies=[Depends(verify_gateway_key)])
+async def get_job_artifacts(job_id: str):
+    """List artifacts for a completed job."""
+    from artifact_store import list_artifacts, get_signed_url
+    result = list_artifacts(job_id=job_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error", "artifacts_not_found"))
+
+    items = result.get("items", [])
+    enriched = []
+    for item in items:
+        name = item.get("name", "")
+        url_result = get_signed_url(job_id=job_id, name=name)
+        enriched.append({
+            "name": name,
+            "size_bytes": item.get("size", 0),
+            "signed_url": url_result.get("signed_url"),
+            "expires_in_seconds": url_result.get("expires_in_seconds"),
+            "backend": result.get("backend"),
+            "non_durable": result.get("backend") == "local",
+        })
+
+    return {
+        "job_id": job_id,
+        "backend": result.get("backend"),
+        "artifacts": enriched,
+        "count": len(enriched),
+    }
+
+
+@app.get("/agents/{slug}/capabilities")
+async def agent_capabilities(slug: str):
+    """Return detailed capability and status metadata for an agent."""
+    from capability_cards import card_for
+    from tools import get_tool, _TOOL_SCHEMAS
+
+    try:
+        from bundle_loader import load_bundle
+        bundle = load_bundle(slug)
+    except Exception:
+        bundle = None
+
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    tools_advertised = bundle.get("tools_advertised", [])
+    tool_verification = {}
+    for t in tools_advertised:
+        registered = get_tool(t) is not None
+        has_schema = t in _TOOL_SCHEMAS
+        tool_verification[t] = {"registered": registered, "has_schema": has_schema}
+
+    all_verified = all(v["registered"] for v in tool_verification.values())
+
+    runtime_level = bundle.get("runtime_level", "skill_bundle")
+    artifact_support = "file_write" in tools_advertised
+    browser_required = "conduit" in tools_advertised or bundle.get("browser_required", False)
+
+    card = card_for(slug)
+
+    return {
+        "slug": slug,
+        "name": bundle.get("name"),
+        "runtime_level": runtime_level,
+        "tools_verified": all_verified,
+        "tool_verification": tool_verification,
+        "artifact_support": artifact_support,
+        "browser_required": browser_required,
+        "job_mode": bundle.get("job_mode", "sync"),
+        "is_orchestrator": bundle.get("is_orchestrator", False),
+        "eval_pass_rate": bundle.get("eval_pass_rate"),
+        "last_verified_at": bundle.get("last_verified_at"),
+        "pricing": card.get("pricing") if card else None,
+        "reputation": card.get("reputation") if card else None,
+    }
+
+
 @app.get("/agents")
 async def list_agents():
     return {

