@@ -1275,42 +1275,124 @@ async def health():
 
 @app.get("/health/browser")
 async def health_browser():
-    """Report browser/Patchright readiness."""
-    import shutil
+    """Report browser/Patchright/Conduit readiness with detailed diagnostics."""
     cache_dir = os.path.expanduser("~/.cache/ms-playwright")
-    chromium_dirs = []
-    browser_installed = False
+    chromium_dirs: list[str] = []
+    chromium_installed = False
     executable_path = None
 
     if os.path.isdir(cache_dir):
         for entry in os.scandir(cache_dir):
             if entry.is_dir() and "chromium" in entry.name.lower():
                 chromium_dirs.append(entry.name)
-                # Look for actual executable
-                for root, dirs, files in os.walk(entry.path):
+                for root, _dirs, files in os.walk(entry.path):
                     for fname in files:
                         if fname in ("chrome", "chromium", "chrome.exe", "chromium.exe", "headless_shell"):
                             executable_path = os.path.join(root, fname)
-                            browser_installed = True
+                            chromium_installed = True
                             break
-                    if browser_installed:
+                    if chromium_installed:
                         break
 
-    conduit_available = False
+    # conduit_browser package importability
+    conduit_package_importable = False
+    conduit_bridge_startable = False
+    startup_error = None
     try:
-        import conduit_browser  # noqa: F401
-        conduit_available = True
-    except ImportError:
+        from conduit_browser import ConduitBridge  # noqa: F401
+        conduit_package_importable = True
+        try:
+            ConduitBridge(session_id="health_check", budget_cents=0)
+            conduit_bridge_startable = True
+        except Exception as inst_err:
+            startup_error = f"ConduitBridge() instantiation failed: {inst_err}"
+    except ImportError as imp_err:
+        startup_error = f"import conduit_browser failed: {imp_err}"
+
+    # Memory check (Linux /proc/meminfo)
+    memory_warning = None
+    try:
+        with open("/proc/meminfo") as _mf:
+            for _line in _mf:
+                if _line.startswith("MemAvailable:"):
+                    available_kb = int(_line.split()[1])
+                    available_mb = available_kb // 1024
+                    if available_mb < 300:
+                        memory_warning = (
+                            f"Only {available_mb} MB RAM available — Chromium needs ~300+ MB; "
+                            "OOM likely. Upgrade to Standard 2 GB plan."
+                        )
+                    break
+    except Exception:
         pass
 
+    render_instance_type = (
+        os.getenv("RENDER_INSTANCE_TYPE")
+        or os.getenv("RENDER_SERVICE_TYPE")
+        or "unknown"
+    )
+
     return {
-        "browser_installed": browser_installed,
+        "chromium_installed": chromium_installed,
         "executable_path": executable_path,
-        "cache_dir": cache_dir,
         "chromium_dirs": chromium_dirs,
-        "conduit_available": conduit_available,
-        "note": "browser jobs require paid Render instance with >= 512MB RAM; not available on free tier",
+        "conduit_package_importable": conduit_package_importable,
+        "conduit_bridge_startable": conduit_bridge_startable,
+        "startup_error": startup_error,
+        "memory_warning": memory_warning,
+        "render_instance_type": render_instance_type,
+        "smoke_test_url": "/health/conduit/smoke",
     }
+
+
+@app.get("/health/conduit/smoke")
+async def health_conduit_smoke():
+    """Live Conduit smoke test: launch Chromium, navigate to example.com, read title, close."""
+    import time
+    start = time.monotonic()
+    try:
+        from patchright.async_api import async_playwright  # type: ignore[import]
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            page = await browser.new_page()
+            await page.goto("https://example.com", wait_until="domcontentloaded", timeout=30000)
+            title = await page.title()
+            await browser.close()
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return {
+            "ok": True,
+            "title": title,
+            "elapsed_ms": elapsed_ms,
+            "note": "Chromium launched successfully on this Render instance",
+        }
+    except MemoryError as mem_err:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return {
+            "ok": False,
+            "error": "MemoryError",
+            "message": str(mem_err),
+            "elapsed_ms": elapsed_ms,
+            "recommendation": "Upgrade to Standard 2 GB plan — Chromium requires ~300+ MB free RAM",
+        }
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        err_type = type(exc).__name__
+        msg = str(exc)
+        recommendation = None
+        if "chromium" in msg.lower() or "executable" in msg.lower():
+            recommendation = "Add 'python -m patchright install chromium' to Render build command"
+        elif "memory" in msg.lower() or "oom" in msg.lower() or "killed" in msg.lower():
+            recommendation = "Upgrade to Standard 2 GB plan — Chromium OOM on current instance"
+        return {
+            "ok": False,
+            "error": err_type,
+            "message": msg,
+            "elapsed_ms": elapsed_ms,
+            "recommendation": recommendation,
+        }
 
 
 @app.get("/health/worker")
