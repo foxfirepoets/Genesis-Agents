@@ -156,9 +156,44 @@ def _get_runtime() -> Any:
     return _RUNTIME
 
 
+_GENESIS_AUTO_WORKER_TASK: Optional[Any] = None
+
+
+async def _genesis_auto_worker_loop() -> None:
+    """In-process background worker loop (Phase 7).
+
+    Activated by GENESIS_WORKER_ENABLED=true. Polls for QUEUED jobs on a fixed
+    interval WITHOUT calling the internal tick HTTP endpoint.
+    """
+    from worker import run_tick, _worker_state  # noqa: PLC0415
+
+    interval = float(os.getenv("GENESIS_WORKER_INTERVAL_SECONDS", "10"))
+    tick_limit = int(os.getenv("GENESIS_WORKER_TICK_LIMIT", "3"))
+    _worker_state["enabled"] = True
+    logger.info(
+        "genesis_auto_worker started interval=%.1fs tick_limit=%d", interval, tick_limit
+    )
+    while True:
+        try:
+            result = await run_tick(limit=tick_limit, expire_stale=True)
+            _worker_state["last_tick_at"] = __import__("time").time()
+            if result.get("claimed", 0) > 0:
+                logger.info(
+                    "genesis_auto_worker tick claimed=%d processed=%d jobs=%s",
+                    result["claimed"],
+                    result["processed"],
+                    result.get("job_ids", []),
+                )
+        except Exception:
+            logger.exception("genesis_auto_worker tick error")
+        await asyncio.sleep(interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Kick off Patchright Chromium install in background; uvicorn serves immediately."""
+    """Kick off Patchright Chromium install + optional in-process worker on startup."""
+    global _GENESIS_AUTO_WORKER_TASK
+
     cache_dir = os.path.expanduser("~/.cache/ms-playwright")
     has_browser = os.path.isdir(cache_dir) and any(True for _ in os.scandir(cache_dir))
     if not has_browser:
@@ -173,7 +208,25 @@ async def lifespan(app: FastAPI):
             logger.warning("Could not start patchright install: %s", exc)
     else:
         logger.info("Patchright Chromium already installed.")
+
+    # Phase 7: in-process auto-worker (does NOT use the tick HTTP endpoint)
+    genesis_worker_enabled = os.getenv("GENESIS_WORKER_ENABLED", "").lower() in {
+        "1", "true", "yes"
+    }
+    if genesis_worker_enabled and _JOB_STORE_OK:
+        _GENESIS_AUTO_WORKER_TASK = asyncio.create_task(_genesis_auto_worker_loop())
+        _background_tasks.add(_GENESIS_AUTO_WORKER_TASK)
+        _GENESIS_AUTO_WORKER_TASK.add_done_callback(_background_tasks.discard)
+        logger.info("genesis auto-worker enabled and started")
+
     yield
+
+    if _GENESIS_AUTO_WORKER_TASK is not None and not _GENESIS_AUTO_WORKER_TASK.done():
+        _GENESIS_AUTO_WORKER_TASK.cancel()
+        try:
+            await _GENESIS_AUTO_WORKER_TASK
+        except asyncio.CancelledError:
+            pass
 
 
 _environment = os.getenv("ENVIRONMENT", "production")
@@ -1938,6 +1991,46 @@ async def get_job_status(job_id: str):
         if job.get(k):
             job[k] = job[k].isoformat() if hasattr(job[k], "isoformat") else str(job[k])
     return job
+
+
+@app.get("/agents/jobs/{job_id}/events", dependencies=[Depends(verify_gateway_key)])
+async def get_job_events(job_id: str):
+    """Return persisted runtime events for a job (Phase 4 observability).
+
+    Events are written to /tmp/jobs/{job_id}/logs/events.jsonl during execution.
+    Returns [] if the job has no events yet (job not started or events file missing).
+    """
+    try:
+        from runtime.observability import get_events
+        events = get_events(job_id)
+        return {"job_id": job_id, "events": events, "count": len(events)}
+    except Exception as exc:
+        logger.exception("get_job_events failed job=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"events_read_failed: {exc}")
+
+
+@app.get("/agents/jobs/{job_id}/sandbox", dependencies=[Depends(verify_gateway_key)])
+async def get_job_sandbox(job_id: str):
+    """Return sandbox lifecycle state for a job (Phase 6).
+
+    States: CREATED → ACTIVE → FINALIZING → UPLOADED → CLEANED → FAILED
+    Returns 404 if the workspace was never registered (job not found or pre-hardening).
+    """
+    try:
+        from runtime.workspace_manager import get_workspace
+        ws = get_workspace(job_id)
+        if ws is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No sandbox registered for job_id={job_id!r}. "
+                "Job may not exist or predates hardening.",
+            )
+        return ws.as_dict()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("get_job_sandbox failed job=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"sandbox_read_failed: {exc}")
 
 
 @app.post("/internal/genesis-worker/tick")

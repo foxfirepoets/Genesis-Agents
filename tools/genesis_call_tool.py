@@ -16,6 +16,7 @@ async def genesis_call(
     params: dict[str, Any] | None = None,
     _runtime: Any = None,
     _parent_job_id: str | None = None,
+    _session_id: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Dispatch to another Genesis agent. _runtime is injected by the caller's agent_runtime instance."""
@@ -27,14 +28,23 @@ async def genesis_call(
         }
 
     child_job_id = f"child-{uuid.uuid4().hex[:12]}"
+    child_session_id = str(uuid.uuid4())
     try:
-        result = await _runtime.execute_agent(agent, task, params or {}, job_id=child_job_id)
+        result = await _runtime.execute_agent(
+            agent, task, params or {}, job_id=child_job_id, session_id=child_session_id
+        )
         child_ok = bool(result.get("ok"))
         child_response = str(result.get("response", ""))
+        # child_session_id may also appear in the child trace if hardening is active
+        resolved_child_session_id = (
+            (result.get("trace") or {}).get("session_id") or child_session_id
+        )
         return {
             "ok": True,
             "target_agent_slug": agent,
             "child_job_id": child_job_id,
+            "child_session_id": resolved_child_session_id,
+            "parent_session_id": _session_id,
             "child_ok": child_ok,
             "child_response_summary": child_response[:500],
             "child_trace": result.get("trace", {}),
@@ -48,6 +58,8 @@ async def genesis_call(
             "ok": False,
             "target_agent_slug": agent,
             "child_job_id": child_job_id,
+            "child_session_id": child_session_id,
+            "parent_session_id": _session_id,
             "error": type(e).__name__,
             "message": str(e),
             "agent": agent,

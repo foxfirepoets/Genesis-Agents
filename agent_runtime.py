@@ -11,6 +11,36 @@ from typing import Any, Optional
 from bundle_loader import load_bundle
 from tools import get_tool, tool_schemas_for, register_default_tools
 
+# Phase 2-8 hardening modules — imported tolerantly so the runtime boots in
+# stripped environments (tests without full deps, etc.)
+try:
+    from runtime.workspace_manager import create_workspace, set_workspace_status, get_workspace
+    _WS_MANAGER_OK = True
+except Exception:
+    _WS_MANAGER_OK = False
+
+try:
+    from runtime.observability import (
+        emit_event,
+        EVT_JOB_CREATED, EVT_AGENT_STARTED, EVT_LLM_REQUESTED, EVT_LLM_RESPONDED,
+        EVT_TOOL_CALLED, EVT_TOOL_BLOCKED, EVT_TOOL_RESULT,
+        EVT_SUBAGENT_DISPATCHED, EVT_SUBAGENT_RETURNED,
+        EVT_JOB_COMPLETED, EVT_JOB_FAILED, EVT_SANDBOX_STATUS,
+    )
+    _OBS_OK = True
+except Exception:
+    _OBS_OK = False
+    def emit_event(job_id: str, event_type: str, data: Any = None) -> None:  # type: ignore[misc]
+        pass
+
+try:
+    from runtime.tool_policy import check_tool_policy
+    _POLICY_OK = True
+except Exception:
+    _POLICY_OK = False
+    def check_tool_policy(agent_slug: str, tool_name: str) -> dict:  # type: ignore[misc]
+        return {"ok": True, "tool_name": tool_name, "agent_slug": agent_slug}
+
 log = logging.getLogger(__name__)
 
 # Resource limits — Phase 11 sandbox enforcement.
@@ -82,15 +112,37 @@ class AgentRuntime:
         self.llm_key = llm_key
         _ensure_tools_registered()
 
-    async def execute_agent(self, slug: str, task: str, params: dict[str, Any], *, job_id: Optional[str] = None) -> dict[str, Any]:
+    async def execute_agent(
+        self,
+        slug: str,
+        task: str,
+        params: dict[str, Any],
+        *,
+        job_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
         """Execute one agent invocation. Returns structured result."""
         bundle = load_bundle(slug)
         if bundle is None:
             return {"ok": False, "error": "unknown_slug", "slug": slug}
 
         job_id = job_id or f"job-{uuid.uuid4().hex[:12]}"
-        job_dir = Path(f"/tmp/jobs/{job_id}")
-        job_dir.mkdir(parents=True, exist_ok=True)
+        session_id = session_id or str(uuid.uuid4())
+
+        # Phase 2/6: Register workspace and set initial sandbox status
+        if _WS_MANAGER_OK:
+            ws = create_workspace(job_id, session_id)
+            job_dir = ws.path
+            set_workspace_status(job_id, "ACTIVE")
+        else:
+            job_dir = Path(f"/tmp/jobs/{job_id}")
+            job_dir.mkdir(parents=True, exist_ok=True)
+
+        # Phase 4: emit job.created
+        emit_event(job_id, EVT_JOB_CREATED if _OBS_OK else "job.created", {
+            "session_id": session_id,
+            "agent_slug": slug,
+        })
 
         # Lazy-init Conduit bridge per job (only if conduit is in tools_advertised)
         bridge = None
@@ -179,7 +231,7 @@ class AgentRuntime:
                 bridge = None
 
         try:
-            return await self._run_loop(bundle, task, params, job_id, job_dir, bridge)
+            return await self._run_loop(bundle, task, params, job_id, job_dir, bridge, session_id)
         finally:
             if bridge is not None:
                 try:
@@ -202,6 +254,7 @@ class AgentRuntime:
         job_id: str,
         job_dir: Path,
         bridge: Any,
+        session_id: str = "",
     ) -> dict[str, Any]:
         slug = bundle["slug"]
         last_swarmsync: dict[str, Any] | None = None
@@ -209,6 +262,9 @@ class AgentRuntime:
         token_budget = bundle.get("token_budget", 4000)
         model = bundle.get("model_hint", "anthropic/claude-sonnet-4-5")
         timeout_s = bundle.get("timeout_s", DEFAULT_TIMEOUT_S)
+
+        # Phase 4: agent.started
+        emit_event(job_id, "agent.started", {"session_id": session_id, "agent_slug": slug})
 
         system_prompt = bundle["system_prompt"]
         user_prompt = task + (f"\n\nAdditional params: {json.dumps(params)}" if params else "")
@@ -227,6 +283,8 @@ class AgentRuntime:
         success_criteria = bundle.get("success_criteria")
 
         tool_call_records: list[dict[str, Any]] = []
+        # Phase 5: separate subagent trace list
+        subagent_records: list[dict[str, Any]] = []
 
         while turn < MAX_TURNS:
             turn += 1
@@ -305,10 +363,12 @@ class AgentRuntime:
                     },
                     "trace": {
                         "job_id": job_id,
+                        "session_id": session_id,
                         "agent_slug": slug,
                         "workspace_path": str(job_dir),
                         "artifact_count": files_written,
                         "tool_calls": tool_call_records,
+                        "subagents": subagent_records,
                         "started_at": started,
                         "finished_at": _finished_at,
                         "status": "ok",
@@ -335,6 +395,17 @@ class AgentRuntime:
                     result["ok"] = False
                     result["error"] = "success_criteria_failed"
                 result["trace"]["status"] = "ok" if result["ok"] else "failed"
+
+                # Phase 4/6: emit completion event + transition sandbox
+                _final_evt = "job.completed" if result["ok"] else "job.failed"
+                emit_event(job_id, _final_evt, {
+                    "session_id": session_id,
+                    "status": result["trace"]["status"],
+                    "turns": turn,
+                    "elapsed_s": result.get("elapsed_s"),
+                })
+                if _WS_MANAGER_OK:
+                    set_workspace_status(job_id, "FINALIZING")
 
                 # Phase 7 — generate VCAP proof bundle if we have a Conduit bridge
                 if bridge is not None:
@@ -394,8 +465,23 @@ class AgentRuntime:
                         "tool": fn_name,
                     }
                 else:
+                    # Phase 8: policy check before execution
+                    _policy = check_tool_policy(slug, fn_name)
+                    if not _policy["ok"]:
+                        emit_event(job_id, "tool.blocked", {
+                            "tool_name": fn_name,
+                            "agent_slug": slug,
+                            "risk_class": _policy.get("risk_class"),
+                            "session_id": session_id,
+                        })
+                        tool_result = {
+                            "ok": False,
+                            "error": "tool_policy_denied",
+                            "tool": fn_name,
+                            "risk_class": _policy.get("risk_class"),
+                        }
                     # Phase 11 — file_write quota enforced BEFORE the call.
-                    if fn_name == "file_write" and files_written >= MAX_FILES_WRITTEN:
+                    elif fn_name == "file_write" and files_written >= MAX_FILES_WRITTEN:
                         tool_result = {
                             "ok": False,
                             "error": "file_write_limit_exceeded",
@@ -403,13 +489,19 @@ class AgentRuntime:
                             "limit": MAX_FILES_WRITTEN,
                         }
                     else:
-                        # Inject context: bridge, job_dir, runtime, parent_job_id
+                        # Inject context: bridge, job_dir, runtime, parent_job_id, session_id
                         ctx = {
                             "_bridge": bridge,
                             "_job_dir": job_dir,
                             "_runtime": self,
                             "_parent_job_id": job_id,
+                            "_session_id": session_id,
                         }
+                        emit_event(job_id, "tool.called", {
+                            "tool_name": fn_name,
+                            "session_id": session_id,
+                            "turn": turn,
+                        })
                         try:
                             tool_result = await tool(**args, **ctx)
                             # Phase 11 — count successful file writes.
@@ -444,13 +536,14 @@ class AgentRuntime:
                     "parent_job_id": job_id,
                     "parent_agent_slug": slug,
                 }
-                # genesis_call gets extra linkage fields
+                # genesis_call gets extra linkage fields + Phase 5 subagent trace entry
                 if fn_name == "genesis_call" and isinstance(tool_result, dict):
                     record["target_agent_slug"] = (
                         tool_result.get("target_agent_slug")
                         or tool_result.get("agent", "")
                     )
                     record["child_job_id"] = tool_result.get("child_job_id")
+                    record["child_session_id"] = tool_result.get("child_session_id")
                     record["child_ok"] = tool_result.get(
                         "child_ok", bool(tool_result.get("ok"))
                     )
@@ -458,6 +551,30 @@ class AgentRuntime:
                     if not child_summary and isinstance(tool_result.get("result"), dict):
                         child_summary = str(tool_result["result"].get("response", ""))[:300]
                     record["child_response_summary"] = child_summary
+
+                    # Phase 5: dedicated subagent trace entry
+                    subagent_records.append({
+                        "parent_job_id": job_id,
+                        "parent_session_id": session_id,
+                        "parent_agent_slug": slug,
+                        "child_job_id": tool_result.get("child_job_id"),
+                        "child_session_id": tool_result.get("child_session_id"),
+                        "child_agent_slug": record["target_agent_slug"],
+                        "task": args.get("task", ""),
+                        "status": "ok" if record["child_ok"] else "failed",
+                        "child_ok": record["child_ok"],
+                        "child_trace_uri": None,
+                        "artifact_uris": [],
+                    })
+
+                    emit_event(job_id, "subagent.returned", {
+                        "child_job_id": tool_result.get("child_job_id"),
+                        "child_session_id": tool_result.get("child_session_id"),
+                        "child_agent_slug": record["target_agent_slug"],
+                        "child_ok": record["child_ok"],
+                        "session_id": session_id,
+                    })
+
                 tool_call_records.append(record)
 
                 # Append tool result message
