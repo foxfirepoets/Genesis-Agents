@@ -633,6 +633,29 @@ def test_meta_real_orchestration() -> bool:
 
     agents_called = [gc.get("target_agent_slug") for gc in genesis_calls]
     print(f"  {PASS} Trace-proven genesis_call delegations: {agents_called}")
+
+    # Phase 5 hardening check: trace.subagents list with child_session_id
+    subagents = trace.get("subagents", [])
+    print(f"  trace.subagents count: {len(subagents)}")
+    if subagents:
+        for i, sa in enumerate(subagents):
+            print(f"    [{i}] child_agent={sa.get('child_agent_slug')} "
+                  f"child_session={sa.get('child_session_id')} child_ok={sa.get('child_ok')}")
+        missing_sessions = [i for i, sa in enumerate(subagents) if not sa.get("child_session_id")]
+        if missing_sessions:
+            print(f"  {FAIL} subagents[{missing_sessions}] missing child_session_id")
+            return False
+        parent_session = trace.get("session_id")
+        if parent_session:
+            missing_parent = [i for i, sa in enumerate(subagents)
+                              if sa.get("parent_session_id") != parent_session]
+            if missing_parent:
+                print(f"  {FAIL} subagents[{missing_parent}] have wrong parent_session_id")
+                return False
+        print(f"  {PASS} trace.subagents: all entries have child_session_id + parent_session_id")
+    else:
+        print(f"  [INFO] trace.subagents empty — hardening deploy may not yet be active")
+
     return True
 
 
@@ -653,6 +676,121 @@ def test_conduit_browser() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Test: automatic_worker_execution — job processed WITHOUT tick endpoint call
+# ---------------------------------------------------------------------------
+
+def test_automatic_worker_execution() -> bool:
+    """Submit an async job and verify it reaches DELIVERED without calling
+    the internal /genesis-worker/tick endpoint.
+
+    Requires GENESIS_WORKER_ENABLED=true on the Render service (Phase 7).
+    The in-process auto-worker polls every GENESIS_WORKER_INTERVAL_SECONDS (default 10s)
+    and picks up QUEUED jobs automatically.
+    """
+    print("\n[TEST automatic_worker_execution] Job processed by in-process auto-worker (no tick)")
+
+    if not GATEWAY_API_KEY and not AGENT_GATEWAY_SECRET:
+        print(f"  {SKIP} automatic_worker_execution: auth not set — cannot run")
+        return False
+
+    import urllib.request
+
+    def _post(path: str, payload: dict) -> dict:
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(
+            f"{RENDER_URL}{path}",
+            data=data,
+            headers={"Content-Type": "application/json", **_auth_headers()},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def _get(path: str) -> dict:
+        req = urllib.request.Request(
+            f"{RENDER_URL}{path}",
+            headers=_auth_headers(),
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+
+    # First verify the worker reports as enabled
+    try:
+        worker_health = _get("/health/worker")
+        if not worker_health.get("enabled"):
+            print(f"  {SKIP} /health/worker reports enabled=False — set GENESIS_WORKER_ENABLED=true on Render")
+            print(f"         health/worker: {worker_health}")
+            return None  # type: ignore  # SKIP
+        print(f"  /health/worker enabled=True last_tick={worker_health.get('last_tick_at')}")
+    except Exception as e:
+        print(f"  {FAIL} /health/worker failed: {e}")
+        return False
+
+    # Submit a simple async job (genesis-research is async via job_mode)
+    try:
+        submit_resp = _post("/agents/genesis-research/run", {
+            "task": "What year was Python created? Reply with just the year.",
+            "params": {},
+        })
+    except Exception as e:
+        print(f"  {FAIL} Submit request failed: {e}")
+        return False
+
+    raw_resp = submit_resp.get("response", "")
+    try:
+        job_info = json.loads(raw_resp) if isinstance(raw_resp, str) else {}
+    except json.JSONDecodeError:
+        job_info = {}
+
+    job_id = job_info.get("job_id") or submit_resp.get("job_id")
+    if not job_id:
+        print(f"  Hmm — submit_resp={submit_resp!r}")
+        # genesis-research might not be async; use the alternate submit path
+        try:
+            submit_resp2 = _post("/agents/genesis-research/jobs", {
+                "prompt": "What year was Python created? Reply with just the year.",
+                "params": {},
+            })
+            job_id = submit_resp2.get("job_id")
+            if not job_id:
+                print(f"  {FAIL} No job_id from /jobs endpoint either: {submit_resp2}")
+                return False
+        except Exception as e2:
+            print(f"  {FAIL} Fallback /jobs submit failed: {e2}")
+            return False
+
+    print(f"  Submitted job_id: {job_id}")
+    print(f"  NOTE: NOT calling tick endpoint — relying on in-process auto-worker")
+
+    # Poll up to 3 minutes — no tick endpoint call
+    deadline = time.time() + 180
+    last_status = "UNKNOWN"
+    while time.time() < deadline:
+        time.sleep(8)
+        try:
+            status_resp = _get(f"/agents/jobs/{job_id}")
+        except Exception as e:
+            print(f"  poll error: {e}")
+            continue
+
+        last_status = status_resp.get("status", "UNKNOWN")
+        elapsed = int(time.time() - (deadline - 180))
+        print(f"  [{elapsed}s] status={last_status}")
+
+        if last_status in ("DELIVERED", "DELIVERED_WITH_ARTIFACT_WARNING"):
+            print(f"  {PASS} Job reached {last_status} via auto-worker (no tick endpoint used)")
+            return True
+        elif last_status == "FAILED":
+            print(f"  {FAIL} Job FAILED: {status_resp.get('errorCode')} {status_resp.get('errorMessage', '')[:200]}")
+            return False
+
+    print(f"  {FAIL} Job did not reach DELIVERED within 180s (last: {last_status}). "
+          "Check GENESIS_WORKER_ENABLED=true is set on Render.")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -663,6 +801,7 @@ TESTS = {
     "meta_real_orchestration": test_meta_real_orchestration,
     "render_async_job": test_render_async_job,
     "conduit_browser": test_conduit_browser,
+    "automatic_worker_execution": test_automatic_worker_execution,
 }
 
 if __name__ == "__main__":
