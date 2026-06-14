@@ -196,9 +196,14 @@ class AgentRuntime:
                 except Exception:
                     log.exception("session load failed; continuing without buyer session")
 
-                await bridge.start()
-
+                # Lazy browser: only launch Chromium up-front when we must
+                # inject a buyer session (concierge mode). Otherwise the browser
+                # starts on first conduit tool call (ensure_started), so jobs
+                # that never browse use ZERO browser memory. This + the stop()
+                # fix below prevents the per-job Chromium leak that OOM'd the
+                # instance.
                 if buyer_session is not None:
+                    await bridge.start()
                     try:
                         # Conduit's session-import API is the BrowserTool's
                         # cookie-jar label system: write the cookie array as
@@ -447,8 +452,10 @@ class AgentRuntime:
                 if _WS_MANAGER_OK:
                     set_workspace_status(job_id, "FINALIZING")
 
-                # Phase 7 — generate VCAP proof bundle if we have a Conduit bridge
-                if bridge is not None:
+                # Phase 7 — generate VCAP proof bundle only if the browser was
+                # actually used (started). Skipping when unused avoids launching
+                # Chromium just to produce a proof for a non-browser job.
+                if bridge is not None and getattr(bridge, "is_started", lambda: True)():
                     try:
                         from proof_bridge import generate_proof_for_job
                         proof = await generate_proof_for_job(

@@ -36,6 +36,11 @@ async def conduit_call(action: str, *, _bridge: "ConduitBridge | None" = None, *
             "message": "ConduitBridge not provided by runtime",
         }
     try:
+        # Lazy browser launch: Chromium starts only when a browser action is
+        # actually requested, so file/shell/search-only jobs use no browser RAM.
+        ensure = getattr(_bridge, "ensure_started", None)
+        if ensure is not None:
+            await ensure()
         args = {"action": action, **kwargs}
         result_str = await _bridge.execute(args)
         if isinstance(result_str, str):
