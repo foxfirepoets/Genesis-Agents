@@ -49,7 +49,15 @@ def _conn():
     db_url = _database_url()
     if not db_url:
         raise RuntimeError("DATABASE_URL not configured")
-    return psycopg.connect(db_url, row_factory=dict_row, prepare_threshold=None)
+    # connect_timeout bounds how long a blocking connect can stall the caller —
+    # without it, pooler saturation could hang the worker's event loop
+    # indefinitely (manifesting as stale-heartbeat job expiry).
+    return psycopg.connect(
+        db_url,
+        row_factory=dict_row,
+        prepare_threshold=None,
+        connect_timeout=int(os.getenv("GENESIS_DB_CONNECT_TIMEOUT_S", "10")),
+    )
 
 
 def _gen_id() -> str:
