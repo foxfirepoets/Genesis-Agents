@@ -41,6 +41,14 @@ except Exception:
     def check_tool_policy(agent_slug: str, tool_name: str) -> dict:  # type: ignore[misc]
         return {"ok": True, "tool_name": tool_name, "agent_slug": agent_slug}
 
+# Phase 3/6: durable session + relationship store (Postgres-backed, best-effort).
+try:
+    import durable_store
+    _DURABLE_OK = True
+except Exception:
+    _DURABLE_OK = False
+    durable_store = None  # type: ignore
+
 log = logging.getLogger(__name__)
 
 # Resource limits — Phase 11 sandbox enforcement.
@@ -120,6 +128,8 @@ class AgentRuntime:
         *,
         job_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        parent_job_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Execute one agent invocation. Returns structured result."""
         bundle = load_bundle(slug)
@@ -137,6 +147,21 @@ class AgentRuntime:
         else:
             job_dir = Path(f"/tmp/jobs/{job_id}")
             job_dir.mkdir(parents=True, exist_ok=True)
+
+        # Phase 3: durable session record (survives restart; retrievable via
+        # GET /agents/sessions/{id}). Best-effort — never blocks the job.
+        if _DURABLE_OK:
+            try:
+                durable_store.session_create(
+                    session_id=session_id,
+                    job_id=job_id,
+                    agent_slug=slug,
+                    parent_job_id=parent_job_id,
+                    parent_session_id=parent_session_id,
+                    workspace_root=str(job_dir),
+                )
+            except Exception:
+                log.debug("durable session_create failed for %s", job_id, exc_info=True)
 
         # Phase 4: emit job.created
         emit_event(job_id, EVT_JOB_CREATED if _OBS_OK else "job.created", {
@@ -230,14 +255,29 @@ class AgentRuntime:
                 log.exception("ConduitBridge failed to start for %s", slug)
                 bridge = None
 
+        _result: dict[str, Any] | None = None
         try:
-            return await self._run_loop(bundle, task, params, job_id, job_dir, bridge, session_id)
+            _result = await self._run_loop(bundle, task, params, job_id, job_dir, bridge, session_id)
+            return _result
         finally:
             if bridge is not None:
                 try:
                     await bridge.stop()
                 except Exception:
                     log.warning("bridge.stop() failed for %s", job_id)
+            # Phase 3: finalize the durable session for every return path
+            # (success, failure, timeout, exception). Best-effort.
+            if _DURABLE_OK:
+                try:
+                    _ok = bool(_result and _result.get("ok"))
+                    durable_store.session_finish(
+                        session_id,
+                        status="COMPLETED" if _ok else "FAILED",
+                        trace=(_result or {}).get("trace"),
+                        error=None if _ok else (_result or {}).get("error"),
+                    )
+                except Exception:
+                    log.debug("durable session_finish failed for %s", job_id, exc_info=True)
             # Concierge cleanup: delete buyer session from vault after job
             # completion so credentials don't accumulate on disk. Best-effort.
             try:
@@ -496,6 +536,7 @@ class AgentRuntime:
                             "_runtime": self,
                             "_parent_job_id": job_id,
                             "_session_id": session_id,
+                            "_parent_agent_slug": slug,
                         }
                         emit_event(job_id, "tool.called", {
                             "tool_name": fn_name,

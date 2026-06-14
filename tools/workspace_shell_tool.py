@@ -113,10 +113,12 @@ async def workspace_shell(
     _job_dir: Path | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Run a shell command inside the job workspace.
+    """Run a shell command inside the job sandbox.
 
-    The working directory must be within _job_dir (/tmp/jobs/{job_id}/).
-    Dangerous commands, secret env vars, and path escapes are all blocked.
+    Delegates to runtime.sandbox_manager.run_in_sandbox(), which provides real
+    kernel isolation via bubblewrap when available (no network, no filesystem
+    outside the workspace) and a hardened process sandbox otherwise. The
+    response includes the active isolation tier.
     """
     if _job_dir is None:
         return {
@@ -125,81 +127,22 @@ async def workspace_shell(
             "message": "workspace_shell requires a job context (_job_dir). Use this tool only within an active job.",
         }
 
-    if not command or not command.strip():
-        return {"ok": False, "error": "empty_command"}
-
-    if _is_blocked(command):
-        return {
-            "ok": False,
-            "error": "command_blocked",
-            "message": f"Command is blocked by safety policy: {command[:80]}",
-        }
-
-    clamped_timeout = min(max(1, timeout), _MAX_TIMEOUT_S)
-
-    # Resolve working directory — default to workspace subdir
-    workspace_dir = _job_dir / "workspace"
-    workspace_dir.mkdir(parents=True, exist_ok=True)
-    (_job_dir / "tmp").mkdir(parents=True, exist_ok=True)
-
-    if cwd:
-        resolved_cwd = (workspace_dir / cwd).resolve()
-    else:
-        resolved_cwd = workspace_dir.resolve()
-
     try:
-        _assert_within_workspace(resolved_cwd, _job_dir)
-    except ValueError as e:
-        return {"ok": False, "error": "path_escape_blocked", "message": str(e)}
+        from runtime.sandbox_manager import run_in_sandbox
+    except Exception as exc:  # noqa: BLE001
+        log.exception("sandbox_manager unavailable")
+        return {"ok": False, "error": "sandbox_unavailable", "message": str(exc)}
 
-    resolved_cwd.mkdir(parents=True, exist_ok=True)
-
-    # Build environment
-    safe_env = _build_safe_env(_job_dir)
-    if env_extra:
-        for k, v in env_extra.items():
-            if not _REDACT_PATTERNS.search(k) and not _SECRET_VALUE_RE.search(str(v)):
-                safe_env[k] = str(v)
-
-    def _run_sync() -> dict[str, Any]:
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(resolved_cwd),
-                capture_output=True,
-                timeout=clamped_timeout,
-                env=safe_env,
-            )
-            stdout = result.stdout.decode("utf-8", errors="replace")[:_MAX_OUTPUT_BYTES]
-            stderr = result.stderr.decode("utf-8", errors="replace")[:_MAX_OUTPUT_BYTES]
-            return {
-                "ok": result.returncode == 0,
-                "exit_code": result.returncode,
-                "stdout": stdout,
-                "stderr": stderr,
-                "cwd": str(resolved_cwd),
-                "truncated": len(result.stdout) > _MAX_OUTPUT_BYTES or len(result.stderr) > _MAX_OUTPUT_BYTES,
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "ok": False,
-                "error": "timeout",
-                "timeout_seconds": clamped_timeout,
-                "message": f"Command timed out after {clamped_timeout}s",
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "error": type(exc).__name__,
-                "message": str(exc),
-            }
-
-    try:
-        return await asyncio.to_thread(_run_sync)
-    except Exception as exc:
-        log.exception("workspace_shell failed to dispatch")
-        return {"ok": False, "error": type(exc).__name__, "message": str(exc)}
+    job_id = _job_dir.name
+    return await asyncio.to_thread(
+        run_in_sandbox,
+        job_id,
+        command,
+        timeout_s=timeout,
+        env=env_extra,
+        cwd=cwd,
+        job_dir=_job_dir,
+    )
 
 
 WORKSPACE_SHELL_SCHEMA = {

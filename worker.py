@@ -129,12 +129,16 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
         if result.get("ok"):
             artifact_uris: list[str] = []
             _artifact_upload_ok = True
+            _session_id = (result.get("trace") or {}).get("session_id")
             try:
                 from pathlib import Path
                 from artifact_store import upload_dir
                 job_artifact_dir = Path(f"/tmp/jobs/{job_id}")
                 if job_artifact_dir.exists():
-                    upload_result = upload_dir(job_id=job_id, local_dir=job_artifact_dir)
+                    upload_result = upload_dir(
+                        job_id=job_id, local_dir=job_artifact_dir,
+                        session_id=_session_id, agent_slug=slug,
+                    )
                     if upload_result.get("ok"):
                         artifact_uris = [
                             f.get("signed_url") or f.get("uri", "")
@@ -143,6 +147,16 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
                         ]
                         if artifact_uris:
                             log.info("job %s uploaded %d artifact(s)", job_id, len(artifact_uris))
+                            # Back-fill artifact URIs onto the durable session.
+                            if _session_id:
+                                try:
+                                    import durable_store
+                                    durable_store.session_finish(
+                                        _session_id, status="COMPLETED",
+                                        artifact_uris=artifact_uris,
+                                    )
+                                except Exception:
+                                    log.debug("session artifact back-fill failed for %s", job_id, exc_info=True)
             except Exception:
                 _artifact_upload_ok = False
                 log.exception("artifact upload failed for job %s — marking DELIVERED_WITH_ARTIFACT_WARNING", job_id)

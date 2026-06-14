@@ -60,9 +60,30 @@ def emit_event(
             exc_info=True,
         )
 
+    # Durable mirror to Postgres (best-effort; never breaks the JSONL path).
+    try:
+        import durable_store
+        durable_store.event_insert(
+            job_id, event_type, data or {},
+            session_id=(data or {}).get("session_id"),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def get_events(job_id: str) -> list[dict[str, Any]]:
-    """Read all persisted events for a job. Returns [] if no events file exists."""
+    """Read all persisted events for a job.
+
+    Prefers the durable Postgres store (survives restart / ephemeral disk);
+    falls back to the local JSONL file when the DB is unavailable or empty.
+    """
+    try:
+        import durable_store
+        durable = durable_store.events_get(job_id)
+        if durable:
+            return durable
+    except Exception:  # noqa: BLE001
+        pass
     path = _events_path(job_id)
     if not path.exists():
         return []

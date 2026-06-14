@@ -801,8 +801,15 @@ TESTS = {
     "meta_real_orchestration": test_meta_real_orchestration,
     "render_async_job": test_render_async_job,
     "conduit_browser": test_conduit_browser,
-    "automatic_worker_execution": test_automatic_worker_execution,
+    "legacy_automatic_worker_execution": test_automatic_worker_execution,
 }
+
+# Phase 9 — the 10 real-agent DONE-standard scenarios (one-directional import).
+try:
+    from live_real_agent_tests import REAL_AGENT_TESTS
+    TESTS.update(REAL_AGENT_TESTS)
+except Exception as _e:  # noqa: BLE001
+    print(f"warning: real-agent live tests unavailable: {_e}")
 
 if __name__ == "__main__":
     target = sys.argv[1] if len(sys.argv) > 1 else "all"

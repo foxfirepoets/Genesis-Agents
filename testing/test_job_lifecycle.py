@@ -140,7 +140,13 @@ class TestSuccessfulJobLifecycle:
         delivered_calls = [c for c in mock_update.call_args_list if c.args[1] == "DELIVERED"]
         assert len(delivered_calls) == 1, "Expected exactly one DELIVERED status update"
         assert delivered_calls[0].args[0] == job["id"]
-        assert delivered_calls[0].kwargs.get("result_summary") == "Task complete."
+        # The worker packs {response, trace} into result_summary (commit fbb2bef)
+        # so poll clients can inspect the tool-call trace. Assert the agent's
+        # response is preserved inside that JSON envelope.
+        import json as _json
+        summary = _json.loads(delivered_calls[0].kwargs.get("result_summary"))
+        assert summary["response"] == "Task complete."
+        assert "trace" in summary
 
     @pytest.mark.asyncio
     async def test_escrow_settled_on_success_no_callback(self):

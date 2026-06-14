@@ -110,6 +110,47 @@ def create_job(
         return {"id": row["id"], "status": row["status"], "created_at": row["createdAt"].isoformat(), "idempotent_hit": False}
 
 
+def create_child_job(
+    *,
+    child_job_id: str,
+    agent_slug: str,
+    prompt: str,
+    parent_job_id: str,
+    params: dict | None = None,
+) -> str:
+    """Insert a first-class child job for genesis_call delegation.
+
+    Children execute INLINE inside the parent's runtime (not via the QUEUED
+    worker), so the row is created directly in RUNNING state — this prevents the
+    auto-worker (which only claims QUEUED) from re-running it. The caller
+    finalizes status via update_job_status() once the child returns. Idempotent
+    on child_job_id.
+    """
+    merged_params = dict(params or {})
+    merged_params["_parent_job_id"] = parent_job_id
+    with _conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO genesis_jobs
+              (id, "agentSlug", prompt, params, status, "outputArtifactUris",
+               "startedAt", "createdAt", "updatedAt")
+            VALUES (%s, %s, %s, %s::jsonb, 'RUNNING', '{}', NOW(), NOW(), NOW())
+            ON CONFLICT (id) DO NOTHING
+            """,
+            (child_job_id, agent_slug, prompt, json.dumps(merged_params)),
+        )
+        cur.execute(
+            """
+            INSERT INTO genesis_job_events
+              (id, "jobId", "eventType", "toStatus", "createdAt")
+            VALUES (%s, %s, 'status_change', 'RUNNING', NOW())
+            """,
+            (_gen_id(), child_job_id),
+        )
+        conn.commit()
+    return child_job_id
+
+
 def get_job(job_id: str) -> dict[str, Any] | None:
     with _conn() as conn, conn.cursor() as cur:
         cur.execute(

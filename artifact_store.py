@@ -10,11 +10,27 @@ Env vars:
   GENESIS_SIGNED_URL_TTL_SECONDS (default: 604800 = 7 days)
 """
 from __future__ import annotations
-import logging, os, shutil
+import hashlib, logging, mimetypes, os, shutil
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+def _sha256(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _guess_mime(name: str, fallback: str) -> str:
+    guessed, _ = mimetypes.guess_type(name)
+    return guessed or fallback
 
 S3_BUCKET = os.getenv("GENESIS_S3_BUCKET", "swarmsync-genesis-artifacts")
 LOCAL_DIR = Path(os.getenv("GENESIS_LOCAL_ARTIFACT_DIR", "/var/data/genesis-artifacts"))
@@ -59,13 +75,18 @@ def upload_file(
 
     name = object_name or local_path.name
     key = f"{job_id}/{name}"
+    mime_type = _guess_mime(name, content_type)
+    size_bytes = local_path.stat().st_size
+    sha256 = _sha256(local_path)
+    meta = {"filename": name, "mime_type": mime_type,
+            "size_bytes": size_bytes, "sha256": sha256}
 
     if _s3_available():
         try:
             client = _s3_client()
             client.upload_file(
                 str(local_path), S3_BUCKET, key,
-                ExtraArgs={"ContentType": content_type},
+                ExtraArgs={"ContentType": mime_type},
             )
             signed_url = client.generate_presigned_url(
                 "get_object",
@@ -78,6 +99,7 @@ def upload_file(
                 "uri": f"s3://{S3_BUCKET}/{key}",
                 "signed_url": signed_url,
                 "expires_in_seconds": SIGNED_URL_TTL_S,
+                **meta,
             }
         except (ClientError, BotoCoreError):
             log.exception("S3 upload failed; falling back to local")
@@ -93,20 +115,54 @@ def upload_file(
         "uri": f"file://{dest}",
         "signed_url": f"/artifacts/{job_id}/{name}",  # gateway endpoint serves these
         "expires_in_seconds": None,
+        **meta,
     }
 
 
-def upload_dir(*, job_id: str, local_dir: Path) -> dict[str, Any]:
-    """Upload every file in a directory under {job_id}/. Returns {ok, files: [...]}."""
+def upload_dir(
+    *,
+    job_id: str,
+    local_dir: Path,
+    session_id: str | None = None,
+    agent_slug: str | None = None,
+) -> dict[str, Any]:
+    """Upload every file in a directory under {job_id}/. Returns {ok, files: [...]}.
+
+    Each uploaded file is also recorded in the durable genesis_artifacts table
+    (sha256 / size / mime / uri / signed_url) so artifacts are retrievable with
+    integrity metadata after the job and after restart (Phase 4).
+    """
     if not local_dir.exists() or not local_dir.is_dir():
         return {"ok": False, "error": "dir_missing", "path": str(local_dir)}
+
+    try:
+        import durable_store
+    except Exception:  # noqa: BLE001
+        durable_store = None  # type: ignore
+
+    # Internal runtime dirs are not buyer artifacts — exclude them so the
+    # artifact contract reflects genuine agent output only.
+    _EXCLUDE_TOP = {"logs", "conduit", "__pycache__", ".git"}
 
     results: list[dict[str, Any]] = []
     for entry in local_dir.rglob("*"):
         if entry.is_file():
             rel = entry.relative_to(local_dir).as_posix()
+            if rel.split("/", 1)[0] in _EXCLUDE_TOP:
+                continue
             r = upload_file(job_id=job_id, local_path=entry, object_name=rel)
             results.append(r)
+            if durable_store is not None and r.get("ok"):
+                try:
+                    durable_store.artifact_record(
+                        job_id=job_id, path=rel, filename=r.get("filename", rel),
+                        session_id=session_id, agent_slug=agent_slug,
+                        mime_type=r.get("mime_type"), size_bytes=r.get("size_bytes"),
+                        sha256=r.get("sha256"), storage_backend=r.get("backend"),
+                        uri=r.get("uri"), signed_url=r.get("signed_url"),
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("artifact_record failed job=%s file=%s", job_id, rel, exc_info=True)
 
     return {
         "ok": True,

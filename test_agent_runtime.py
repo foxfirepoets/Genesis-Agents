@@ -88,7 +88,10 @@ def test_swarmsync_router_uses_auto_model_by_default(monkeypatch):
 
     import asyncio
 
-    asyncio.run(rt._call_llm("anthropic/claude-sonnet-4-5", [{"role": "user", "content": "x"}], [], 100))
+    # When the bundle's model_hint is "auto" (the default routing mode) and no
+    # GENESIS_LLM_MODEL override is set, "auto" is passed through so SwarmSync's
+    # complexity scorer chooses the tier.
+    asyncio.run(rt._call_llm("auto", [{"role": "user", "content": "x"}], [], 100))
 
     assert captured["url"] == "https://api.swarmsync.ai/v1/chat/completions"
     assert captured["json"]["model"] == "auto"
@@ -137,9 +140,12 @@ def test_swarmsync_router_passes_auto_model_through(monkeypatch):
     monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
     monkeypatch.setattr(aiohttp, "ClientTimeout", FakeClientTimeout)
 
+    # GENESIS_LLM_MODEL=auto means "let the bundle decide": a concrete bundle
+    # model_hint is respected and passed through (commit 61d56e2), so
+    # function-calling agents like genesis-meta get a capable model.
     asyncio.run(rt._call_llm("anthropic/claude-sonnet-4-5", [{"role": "user", "content": "x"}], [], 100))
 
-    assert captured["json"]["model"] == "auto"
+    assert captured["json"]["model"] == "anthropic/claude-sonnet-4-5"
 
 
 def test_swarmsync_router_passes_concrete_model_through(monkeypatch):

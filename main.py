@@ -1489,13 +1489,73 @@ async def health_worker():
         "queue_depth": queue_depth,
         "stale_job_count": stale_count,
         "worker_mode": os.getenv("WORKER_MODE", "trigger_dev"),
+        "last_error": state.get("last_error"),
+        "commit": os.getenv("RENDER_GIT_COMMIT") or os.getenv("GENESIS_COMMIT"),
     }
+
+
+@app.get("/health/sandbox")
+async def health_sandbox():
+    """Report the active shell sandbox isolation tier (Phase 2).
+
+    isolation="bwrap" means real kernel isolation (filesystem + network
+    namespaces). isolation="process" means the hardened process sandbox with
+    static escape guards (no kernel FS namespace — bwrap not installed).
+    """
+    try:
+        from runtime.sandbox_manager import isolation_mode, _bwrap_works, _ALLOW_NETWORK
+        return {
+            "ok": True,
+            "isolation": isolation_mode(),
+            "bwrap_available": _bwrap_works(),
+            "network_allowed": _ALLOW_NETWORK,
+            "note": (
+                "bwrap = real kernel isolation; process = hardened process "
+                "sandbox + static guards (install bubblewrap / Docker deploy for "
+                "full filesystem namespace isolation)."
+            ),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @app.get("/agents/jobs/{job_id}/artifacts", dependencies=[Depends(verify_gateway_key)])
 async def get_job_artifacts(job_id: str):
-    """List artifacts for a completed job."""
+    """List artifacts for a completed job.
+
+    Prefers the durable genesis_artifacts metadata (sha256 / size / mime /
+    signed_url) recorded at upload time; refreshes signed URLs and falls back to
+    a live storage listing if no durable rows exist.
+    """
     from artifact_store import list_artifacts, get_signed_url
+
+    # Phase 4: durable metadata path (includes integrity checksums).
+    try:
+        import durable_store
+        rows = durable_store.artifacts_by_job(job_id)
+    except Exception:
+        rows = []
+    if rows:
+        artifacts = []
+        for r in rows:
+            name = r.get("path") or r.get("filename")
+            fresh = get_signed_url(job_id=job_id, name=name)
+            artifacts.append({
+                "name": name,
+                "filename": r.get("filename"),
+                "size_bytes": int(r["sizeBytes"]) if r.get("sizeBytes") is not None else None,
+                "sha256": r.get("sha256"),
+                "mime_type": r.get("mimeType"),
+                "backend": r.get("storageBackend"),
+                "uri": r.get("uri"),
+                "signed_url": fresh.get("signed_url") or r.get("signedUrl"),
+                "expires_in_seconds": fresh.get("expires_in_seconds"),
+                "non_durable": r.get("storageBackend") == "local",
+                "created_at": r["createdAt"].isoformat() if r.get("createdAt") and hasattr(r["createdAt"], "isoformat") else r.get("createdAt"),
+            })
+        return {"job_id": job_id, "backend": rows[0].get("storageBackend"),
+                "artifacts": artifacts, "count": len(artifacts), "source": "durable"}
+
     result = list_artifacts(job_id=job_id)
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result.get("error", "artifacts_not_found"))
@@ -2011,13 +2071,15 @@ async def get_job_events(job_id: str):
 
 @app.get("/agents/jobs/{job_id}/sandbox", dependencies=[Depends(verify_gateway_key)])
 async def get_job_sandbox(job_id: str):
-    """Return sandbox lifecycle state for a job (Phase 6).
+    """Return sandbox lifecycle state + isolation tier for a job (Phase 2/6).
 
-    States: CREATED → ACTIVE → FINALIZING → UPLOADED → CLEANED → FAILED
-    Returns 404 if the workspace was never registered (job not found or pre-hardening).
+    States: CREATED → ACTIVE → FINALIZING → UPLOADED → CLEANED → FAILED.
+    Includes the active isolation tier ("bwrap" for real kernel isolation,
+    "process" for the hardened process sandbox). 404 if never registered.
     """
     try:
         from runtime.workspace_manager import get_workspace
+        from runtime.sandbox_manager import sandbox_status
         ws = get_workspace(job_id)
         if ws is None:
             raise HTTPException(
@@ -2025,12 +2087,144 @@ async def get_job_sandbox(job_id: str):
                 detail=f"No sandbox registered for job_id={job_id!r}. "
                 "Job may not exist or predates hardening.",
             )
-        return ws.as_dict()
+        return sandbox_status(job_id)
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("get_job_sandbox failed job=%s", job_id)
         raise HTTPException(status_code=500, detail=f"sandbox_read_failed: {exc}")
+
+
+@app.post("/agents/jobs/{job_id}/sandbox", dependencies=[Depends(verify_gateway_key)])
+async def create_job_sandbox(job_id: str, body: dict | None = None):
+    """Explicitly provision a sandbox for a job (Phase 2 lifecycle)."""
+    try:
+        from runtime.sandbox_manager import create_sandbox
+        session_id = (body or {}).get("session_id")
+        return create_sandbox(job_id, session_id)
+    except Exception as exc:
+        logger.exception("create_job_sandbox failed job=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"sandbox_create_failed: {exc}")
+
+
+@app.post("/agents/jobs/{job_id}/sandbox/destroy", dependencies=[Depends(verify_gateway_key)])
+async def destroy_job_sandbox(job_id: str, body: dict | None = None):
+    """Tear down a job sandbox (Phase 2 lifecycle).
+
+    Body: {"cleanup_policy": "retain_debug" | "purge"}. Default retain_debug.
+    """
+    try:
+        from runtime.sandbox_manager import destroy_sandbox
+        policy = (body or {}).get("cleanup_policy", "retain_debug")
+        result = destroy_sandbox(job_id, cleanup_policy=policy)
+        if not result.get("ok") and result.get("error") == "sandbox_not_found":
+            raise HTTPException(status_code=404, detail=result)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("destroy_job_sandbox failed job=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"sandbox_destroy_failed: {exc}")
+
+
+def _serialize_row(row: dict | None) -> dict | None:
+    """ISO-serialize any datetime values in a DB row dict."""
+    if not row:
+        return row
+    out = dict(row)
+    for k, v in list(out.items()):
+        if hasattr(v, "isoformat"):
+            out[k] = v.isoformat()
+    return out
+
+
+@app.get("/agents/sessions/{session_id}", dependencies=[Depends(verify_gateway_key)])
+async def get_session(session_id: str):
+    """Return a durable agent session record + its child delegations (Phase 3/6).
+
+    Survives service restart — read from Postgres (genesis_agent_sessions),
+    not /tmp. 404 if the session was never persisted.
+    """
+    try:
+        import durable_store
+        session = durable_store.session_get(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
+        job_id = session.get("jobId")
+        rels = durable_store.relationships_by_parent(job_id) if job_id else []
+        children = [
+            r for r in rels if r.get("parentSessionId") in (session_id, None)
+        ]
+        return {
+            "session": _serialize_row(session),
+            "children": [_serialize_row(r) for r in children],
+            "child_count": len(children),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("get_session failed session=%s", session_id)
+        raise HTTPException(status_code=500, detail=f"session_read_failed: {exc}")
+
+
+@app.get("/agents/jobs/{job_id}/trace", dependencies=[Depends(verify_gateway_key)])
+async def get_job_trace(job_id: str):
+    """Return the full parent→child trace tree for a job (Phase 6).
+
+    Aggregates the durable job record, its session(s), lifecycle events, and
+    every child job/session spawned via genesis_call. Proves real delegation
+    linkage that survives restart.
+    """
+    try:
+        import durable_store
+        job = None
+        if _JOB_STORE_OK and get_job is not None:
+            try:
+                job = get_job(job_id)
+            except Exception:
+                job = None
+        sessions = durable_store.sessions_by_job(job_id)
+        rels = durable_store.relationships_by_parent(job_id)
+        try:
+            from runtime.observability import get_events
+            events = get_events(job_id)
+        except Exception:
+            events = []
+
+        children = []
+        for r in rels:
+            child_job_id = r.get("childJobId")
+            child_job = None
+            if child_job_id and _JOB_STORE_OK and get_job is not None:
+                try:
+                    child_job = get_job(child_job_id)
+                except Exception:
+                    child_job = None
+            children.append({
+                "relationship": _serialize_row(r),
+                "child_job": _serialize_row(child_job),
+                "child_sessions": [
+                    _serialize_row(s) for s in durable_store.sessions_by_job(child_job_id)
+                ] if child_job_id else [],
+            })
+
+        if job is None and not sessions and not rels and not events:
+            raise HTTPException(status_code=404, detail=f"no trace found for job: {job_id}")
+
+        return {
+            "job_id": job_id,
+            "job": _serialize_row(job),
+            "sessions": [_serialize_row(s) for s in sessions],
+            "events": events,
+            "event_count": len(events),
+            "children": children,
+            "child_count": len(children),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("get_job_trace failed job=%s", job_id)
+        raise HTTPException(status_code=500, detail=f"trace_read_failed: {exc}")
 
 
 @app.post("/internal/genesis-worker/tick")
