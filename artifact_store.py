@@ -54,12 +54,16 @@ def _s3_available() -> bool:
 
 
 def _s3_client():
-    return boto3.client(
-        "s3",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.getenv("AWS_REGION", "us-east-1"),
-    )
+    kwargs: dict = {
+        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
+        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
+        "region_name": os.getenv("AWS_REGION", "us-east-1"),
+    }
+    # Cloudflare R2 (and any other S3-compatible store) requires endpoint_url.
+    endpoint = os.getenv("GENESIS_S3_ENDPOINT")
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
+    return boto3.client("s3", **kwargs)
 
 
 def upload_file(
