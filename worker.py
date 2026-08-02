@@ -183,8 +183,19 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
             # settles via its own /billing/escrow/:id/agent-callback handler.
             if escrow_id and not is_external_escrow:
                 try:
-                    from escrow_client import complete_escrow
-                    comp = await complete_escrow(escrow_id=escrow_id, status="SETTLED")
+                    # ESCROW BLOCKER 9/11 — escrow_client.complete_escrow.
+                    # PERMANENTLY_PROHIBITED (contract 6.1 item 17). This is the
+                    # single worst path in the repo: it settled escrow with
+                    # status="SETTLED" on job success with NO human in the loop
+                    # at any point. Automation paying is the exact inversion of
+                    # the governing rule. The local import bypassed main.py's
+                    # binding, so the guard is here at the call site.
+                    from escrow_guard import escrow_blocked, escrow_permitted
+                    if not escrow_permitted():
+                        comp = escrow_blocked("complete_escrow")
+                    else:
+                        from escrow_client import complete_escrow
+                        comp = await complete_escrow(escrow_id=escrow_id, status="SETTLED")
                     if comp.get("ok"):
                         log.info("job %s escrow %s SETTLED", job_id, escrow_id)
                     else:
@@ -207,11 +218,20 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
             # Phase 6 — refund the escrow on agent failure, but ONLY when WE own it.
             if escrow_id and not is_external_escrow:
                 try:
-                    from escrow_client import release_escrow
-                    rel = await release_escrow(
-                        escrow_id=escrow_id,
-                        reason=str(result.get("error", "agent_failure")),
-                    )
+                    # ESCROW BLOCKER 10/11 — escrow_client.release_escrow
+                    # (refund on agent failure). PERMANENTLY_PROHIBITED
+                    # (contract 6.1 item 18): a refund is still automation
+                    # moving money. Guarded at the call site because the local
+                    # import bypasses main.py's binding.
+                    from escrow_guard import escrow_blocked, escrow_permitted
+                    if not escrow_permitted():
+                        rel = escrow_blocked("release_escrow")
+                    else:
+                        from escrow_client import release_escrow
+                        rel = await release_escrow(
+                            escrow_id=escrow_id,
+                            reason=str(result.get("error", "agent_failure")),
+                        )
                     if rel.get("ok"):
                         log.info("job %s escrow %s REFUNDED", job_id, escrow_id)
                     else:
@@ -234,11 +254,19 @@ async def process_job(job: dict[str, Any], runtime: AgentRuntime) -> None:
         # Phase 6 — refund the escrow on runtime exception, but ONLY when WE own it.
         if escrow_id and not is_external_escrow:
             try:
-                from escrow_client import release_escrow
-                await release_escrow(
-                    escrow_id=escrow_id,
-                    reason=f"runtime_exception:{type(e).__name__}",
-                )
+                # ESCROW BLOCKER 11/11 — escrow_client.release_escrow (refund on
+                # runtime exception). PERMANENTLY_PROHIBITED (contract 6.1 item
+                # 18). Guarded at the call site because the local import
+                # bypasses main.py's binding.
+                from escrow_guard import escrow_blocked, escrow_permitted
+                if not escrow_permitted():
+                    escrow_blocked("release_escrow")
+                else:
+                    from escrow_client import release_escrow
+                    await release_escrow(
+                        escrow_id=escrow_id,
+                        reason=f"runtime_exception:{type(e).__name__}",
+                    )
             except Exception:
                 log.exception("escrow release raised for job %s", job_id)
     finally:

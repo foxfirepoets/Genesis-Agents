@@ -17,9 +17,17 @@ SEED_JOBS_THRESHOLD = 10
 
 
 def _tool_descriptions() -> dict[str, str]:
-    """Map of tool name -> one-line description for capability cards."""
-    # Keep this close to the gateway's tool registry. Update as new tools land.
-    return {
+    """Map of tool name -> one-line description for capability cards.
+
+    PERMANENTLY_PROHIBITED names are filtered out before the map is returned
+    (docs/FINANCE-TOOL-CONTRACTS.md Section 6.2 Layer 6): a capability card is a
+    public advertisement, and the marketplace must not advertise an operation
+    that cannot and must not run. The filter is applied programmatically rather
+    than by deleting lines, so a name re-added below is suppressed automatically.
+    """
+    from runtime.tool_policy import PROHIBITED_TOOLS
+
+    descriptions = {
         "conduit": "Audited browser automation, multi-engine web search, structured extraction, marketplace adapters, proof bundle export.",
         "file_write": "Write artifacts to ephemeral job storage.",
         "code_format": "Format code via black or prettier.",
@@ -67,6 +75,7 @@ def _tool_descriptions() -> dict[str, str]:
         "vision_compare": "Compare two images.",
         "vision_extract_chart_data": "Extract data from chart images.",
     }
+    return {k: v for k, v in descriptions.items() if k not in PROHIBITED_TOOLS}
 
 
 def _reputation_for(slug: str) -> dict[str, Any]:

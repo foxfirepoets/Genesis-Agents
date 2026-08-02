@@ -118,22 +118,43 @@ except Exception:  # pragma: no cover - ultra-defensive
     logger.warning("proof_bridge could not be imported; /proofs/* disabled")
 
 # Phase 6 — escrow client wrappers around /payments/ap2/* on swarmsync-api.
-# Tolerant import: free-tier callers (Cato) don't need escrow at all.
-try:
-    from escrow_client import (
-        initiate_escrow,
-        complete_escrow,
-        release_escrow,
-        calculate_split,
-    )
-    _ESCROW_OK = True
-except Exception:  # pragma: no cover - ultra-defensive
+#
+# ESCROW CONTAINMENT (docs/FINANCE-TOOL-CONTRACTS.md Sections 3.8 and 6.3).
+# All four escrow functions are PERMANENTLY_PROHIBITED. They construct and
+# transmit funds movements with no per-call human authorization anywhere in the
+# path. escrow_guard.escrow_permitted() is the single choke point: it returns
+# True only under an explicit GENESIS_DEPLOYMENT_PROFILE=swarmsync-marketplace.
+# Unset, or the Cato-facing profile, leaves _ESCROW_OK False, which makes every
+# escrow call site below unreachable — the same code path the gateway already
+# takes for free-tier (Cato) callers, so nothing new can break.
+from escrow_guard import escrow_permitted as _escrow_permitted
+
+if not _escrow_permitted():
     initiate_escrow = None  # type: ignore[assignment]
     complete_escrow = None  # type: ignore[assignment]
     release_escrow = None  # type: ignore[assignment]
     calculate_split = None  # type: ignore[assignment]
     _ESCROW_OK = False
-    logger.warning("escrow_client could not be imported; running free-tier only")
+    logger.warning(
+        "escrow containment active: escrow_client is NOT bound in this build. "
+        "Automation may prepare; a human pays; automation records."
+    )
+else:
+    try:
+        from escrow_client import (
+            initiate_escrow,
+            complete_escrow,
+            release_escrow,
+            calculate_split,
+        )
+        _ESCROW_OK = True
+    except Exception:  # pragma: no cover - ultra-defensive
+        initiate_escrow = None  # type: ignore[assignment]
+        complete_escrow = None  # type: ignore[assignment]
+        release_escrow = None  # type: ignore[assignment]
+        calculate_split = None  # type: ignore[assignment]
+        _ESCROW_OK = False
+        logger.warning("escrow_client could not be imported; running free-tier only")
 
 _RUNTIME: Any = None
 
@@ -193,6 +214,26 @@ async def _genesis_auto_worker_loop() -> None:
 async def lifespan(app: FastAPI):
     """Kick off Patchright Chromium install + optional in-process worker on startup."""
     global _GENESIS_AUTO_WORKER_TASK
+
+    # PERMANENTLY_PROHIBITED enforcement, Layer 2
+    # (docs/FINANCE-TOOL-CONTRACTS.md Section 6.2).
+    #
+    # This runs BEFORE the app accepts traffic and is deliberately NOT wrapped
+    # in try/except. If a prohibited money tool has been re-registered, or the
+    # frozen manifest no longer matches the prohibition list, the process
+    # REFUSES TO START. Fail-to-boot beats fail-to-deny: a denial can be missed
+    # in logs; a service that will not start cannot be.
+    import tools as _tools
+    from runtime.tool_policy import assert_prohibitions_intact
+
+    _tools.register_default_tools()
+    assert_prohibitions_intact()
+    logger.info("prohibition guard: intact (registry and frozen manifest verified)")
+
+    # Escrow containment, Section 6.3. Also unconditional.
+    from escrow_guard import assert_escrow_containment
+
+    assert_escrow_containment()
 
     cache_dir = os.path.expanduser("~/.cache/ms-playwright")
     has_browser = os.path.isdir(cache_dir) and any(True for _ in os.scandir(cache_dir))
@@ -1743,6 +1784,11 @@ async def run_agent(slug: str, body: RunRequest):
                 # can echo it back in the callback payload.
                 if external_escrow_id:
                     escrow_id_async = external_escrow_id
+                # ESCROW BLOCKER 1/11 — escrow_client.initiate_escrow.
+                # PERMANENTLY_PROHIBITED (contract 3.8 / 6.1 item 16). Unreachable
+                # unless GENESIS_DEPLOYMENT_PROFILE=swarmsync-marketplace, which
+                # leaves _ESCROW_OK False. Quarantined rather than deleted: this
+                # is SwarmSync marketplace behaviour that Genesis does not own.
                 elif (
                     _ESCROW_OK
                     and not skip_internal_escrow
@@ -1780,6 +1826,10 @@ async def run_agent(slug: str, body: RunRequest):
                     # If WE reserved the escrow (not the marketplace) and we
                     # failed to enqueue, refund. When external_escrow_id is set,
                     # the marketplace owns the refund decision.
+                    # ESCROW BLOCKER 2/11 — escrow_client.release_escrow (refund on
+                    # enqueue failure). PERMANENTLY_PROHIBITED (6.1 item 18): a
+                    # refund is still automation moving money. Unreachable while
+                    # _ESCROW_OK is False. Quarantined, not deleted.
                     if escrow_id_async and _ESCROW_OK and not external_escrow_id:
                         try:
                             await release_escrow(
@@ -1824,6 +1874,9 @@ async def run_agent(slug: str, body: RunRequest):
                 # External-escrow mode: the marketplace already initiated the
                 # escrow. We do NOT call initiate / complete / release ourselves.
                 # The caller settles or refunds based on the response body.
+                # ESCROW BLOCKER 3/11 — escrow_client.initiate_escrow (sync path).
+                # PERMANENTLY_PROHIBITED (6.1 item 16). Unreachable while
+                # _ESCROW_OK is False. Quarantined, not deleted.
                 if (
                     _ESCROW_OK
                     and not skip_internal_escrow
@@ -1849,6 +1902,9 @@ async def run_agent(slug: str, body: RunRequest):
                     try:
                         result = await runtime.execute_agent(bundle_slug, user_prompt, params)
                     except Exception as inner_exc:
+                        # ESCROW BLOCKER 4/11 — escrow_client.release_escrow
+                        # (refund on runtime exception). PERMANENTLY_PROHIBITED
+                        # (6.1 item 18). Unreachable while _ESCROW_OK is False.
                         if escrow_id_sync and _ESCROW_OK and not external_escrow_id:
                             try:
                                 await release_escrow(
@@ -1862,6 +1918,16 @@ async def run_agent(slug: str, body: RunRequest):
                     # Escrow finalization after runtime returns — only when WE
                     # own the escrow. When external_escrow_id is set, the
                     # marketplace API performs settle/refund itself.
+                    # ESCROW BLOCKERS 5/11, 6/11 and 7/11 —
+                    #   escrow_client.complete_escrow  (6.1 item 17) settles funds
+                    #   escrow_client.calculate_split  (6.1 item 19) constructs the
+                    #     disbursement amount; also truncates with
+                    #     int(total_cents * pct), losing a minor unit on every
+                    #     split where the fee is not a whole number of cents
+                    #   escrow_client.release_escrow   (6.1 item 18) refunds
+                    # All PERMANENTLY_PROHIBITED and unreachable while _ESCROW_OK
+                    # is False. Quarantined, not deleted: settle/refund is
+                    # SwarmSync marketplace behaviour Genesis does not own.
                     if escrow_id_sync and _ESCROW_OK and isinstance(result, dict):
                         if result.get("ok"):
                             comp = await complete_escrow(
@@ -2434,6 +2500,11 @@ async def admin_refund(job_id: str):
         raise HTTPException(status_code=404, detail="job not found")
 
     escrow_released: Any = None
+    # ESCROW BLOCKER 8/11 — escrow_client.release_escrow (admin refund endpoint).
+    # PERMANENTLY_PROHIBITED (6.1 item 18). Unreachable while _ESCROW_OK is
+    # False; the job row still transitions to REFUNDED and the admin_refund
+    # event is still written, so the record-keeping half of the endpoint keeps
+    # working while the money movement does not. Quarantined, not deleted.
     if job.get("escrowId") and _ESCROW_OK and release_escrow is not None:
         try:
             escrow_released = await release_escrow(

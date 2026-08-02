@@ -41,6 +41,18 @@ except Exception:
     def check_tool_policy(agent_slug: str, tool_name: str) -> dict:  # type: ignore[misc]
         return {"ok": True, "tool_name": tool_name, "agent_slug": agent_slug}
 
+# PERMANENTLY_PROHIBITED enforcement (FINANCE-TOOL-CONTRACTS.md Section 6.2
+# Layer 4). Deliberately NOT a tolerant import: the tolerant import above falls
+# back to allowing everything, and a prohibition that can be disabled by an
+# ImportError is not a prohibition. runtime.tool_policy is pure standard
+# library, so this import cannot fail anywhere agent_runtime itself imports.
+from runtime.tool_policy import (  # noqa: E402
+    assert_prohibitions_intact,
+    is_prohibited,
+    prohibition_group,
+)
+from tools._envelope import prohibited_refusal  # noqa: E402
+
 # Phase 3/6: durable session + relationship store (Postgres-backed, best-effort).
 try:
     import durable_store
@@ -109,6 +121,10 @@ def _ensure_tools_registered() -> None:
     global _DEFAULTS_REGISTERED
     if not _DEFAULTS_REGISTERED:
         register_default_tools()
+        # Layer 2 — fail to boot, not fail to deny. If a prohibited tool has
+        # been re-registered, or the frozen manifest no longer matches the
+        # prohibition list, this raises and the runtime does not come up.
+        assert_prohibitions_intact()
         _DEFAULTS_REGISTERED = True
 
 
@@ -504,9 +520,34 @@ class AgentRuntime:
                     args = {}
 
                 tc_started = time.time()
-                tool = get_tool(fn_name)
-                if tool is None or fn_name not in tools_advertised:
-                    tool_result: dict[str, Any] = {
+                tool_result: dict[str, Any]
+                # Layer 4 — prohibition pre-check. Runs BEFORE check_tool_policy
+                # and before any tool is invoked, and is independent of TOOL_RISK
+                # and SLUG_ALLOWED_RISKS, so a mistake in the risk table cannot
+                # reach a prohibited tool. This is also the only place slug-scoped
+                # prohibition is evaluated.
+                tool = None if is_prohibited(fn_name, slug) else get_tool(fn_name)
+                if is_prohibited(fn_name, slug):
+                    # Reaching here means Layers 1-3 have failed. Severity is
+                    # critical on purpose: this must page.
+                    log.critical(
+                        "PROHIBITED TOOL REACHED DISPATCHER: tool=%s slug=%s job=%s",
+                        fn_name, slug, job_id,
+                    )
+                    emit_event(job_id, "tool.prohibited", {
+                        "tool_name": fn_name,
+                        "agent_slug": slug,
+                        "severity": "critical",
+                        "prohibition_group": prohibition_group(fn_name),
+                        "session_id": session_id,
+                    })
+                    tool_result = prohibited_refusal(
+                        fn_name,
+                        group=prohibition_group(fn_name),
+                        agent_slug=slug,
+                    )
+                elif tool is None or fn_name not in tools_advertised:
+                    tool_result = {
                         "ok": False,
                         "error": "tool_not_allowed",
                         "tool": fn_name,
