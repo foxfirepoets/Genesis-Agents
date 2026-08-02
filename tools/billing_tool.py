@@ -1,318 +1,308 @@
-"""Genesis Billing tools - Phase 3 scaffolds.
+"""Genesis Billing tools.
 
-Wraps the operations advertised by skill_bundles/genesis-billing.json so the
-agent runtime can dispatch them without 500s. Real provider integration
-(Stripe, Chargebee, QuickBooks, AP2/x402) lands in Phase 9.
+Implements Sections 4, 5 and 6 of docs/FINANCE-TOOL-CONTRACTS.md.
+
+What changed and why:
+
+  * ``billing_run_dunning_batch`` and ``billing_run_billing_cycle`` are
+    PERMANENTLY_PROHIBITED (Section 6.1 Group A, items 4-5). Bodies, schemas
+    and register_tool lines are DELETED. "Retry" against an overdue invoice
+    means re-presenting a stored payment instrument, which is constructing and
+    transmitting a card charge; the cycle bundles that behind one approval.
+  * Every remaining action returns the Section 5 truthful-failure envelope.
+    ok: true is unreachable without evidence.
+  * ``billing_generate_revops_report`` is implemented per the contract:
+    integer minor units, and annualisation driven by an explicit ``interval``
+    field rather than string-matching the plan name.
 """
 from __future__ import annotations
 
 import logging
-import uuid
+from collections import defaultdict
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any
 
 from . import register_tool
+from ._envelope import (
+    MODE_READ_ONLY,
+    canonical_json,
+    from_exception,
+    not_implemented,
+    now_rfc3339,
+    provider_unconfigured,
+    read_evidence,
+    sha256_hex,
+    success,
+    validation_failed,
+)
 
 log = logging.getLogger(__name__)
 
+# Environment variable NAMES only — never values (Section 5.4).
+_BUDGET_STORE_KEYS = ["GENESIS_JOB_DATABASE_URL", "DATABASE_URL"]
 
-def _scaffold(action: str, args: dict[str, Any], extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": True,
-        "stub": True,
-        "action": action,
-        "args": args,
-        "note": "Phase 3 scaffold - Phase 9 integrates real provider (Stripe / Chargebee / QuickBooks)",
-    }
-    if extra:
-        payload.update(extra)
-    return payload
+_SUB_STATUSES = frozenset({"active", "trial", "cancelled"})
+_SUB_INTERVALS = frozenset({"month", "year"})
 
 
-def _err(action: str, exc: Exception) -> dict[str, Any]:
-    log.exception("billing tool %s failed", action)
-    return {
-        "ok": False,
-        "action": action,
-        "error": type(exc).__name__,
-        "message": str(exc),
-    }
+def _is_int(value: Any) -> bool:
+    """True for a real integer. bool is a subclass of int and is not money."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_currency(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 3 and value.isalpha() and value.isupper()
+
+
+def _allocate(total_minor: int, parts: int) -> list[int]:
+    """Largest-remainder allocation. The parts sum EXACTLY to total_minor.
+
+    Pure integer arithmetic, so no truncation and no float rounding error.
+    The remainder is carried by the earliest buckets, deterministically.
+    """
+    if parts <= 0:
+        raise ValueError("parts must be positive")
+    base, remainder = divmod(total_minor, parts)
+    out = [base] * parts
+    for i in range(remainder):
+        out[i] += 1
+    return out
+
+
+def _basis_points(numerator: int, denominator: int) -> int:
+    if denominator == 0:
+        return 0
+    value = (Decimal(numerator) * Decimal(10000)) / Decimal(denominator)
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_EVEN))
+
+
+def _divide_half_even(numerator: int, denominator: int) -> int:
+    if denominator == 0:
+        return 0
+    value = Decimal(numerator) / Decimal(denominator)
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_EVEN))
 
 
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-async def billing_import_ar_ledger(
-    *,
-    provider: str | None = None,
-    source: str | None = None,
-    price: float | None = None,
-    records: int | None = None,
-    period: str | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
+async def billing_import_ar_ledger(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE (contract 3.2). APPROVAL_REQUIRED — writes a financial record set.
+
+    The previous body returned status "imported" with a caller-supplied record
+    count under ok: true, having imported nothing.
+    """
     try:
-        args = {
-            "provider": provider or source,
-            "source": source or provider,
-            "price": price,
-            "records": records,
-            "period": period,
-        }
-        return _scaffold(
+        return not_implemented(
             "billing_import_ar_ledger",
-            args,
-            extra={
-                "import_id": f"arimp_{uuid.uuid4().hex[:12]}",
-                "records_count": records,
-                "status": "imported",
+            "Importing an accounts-receivable ledger is not implemented. It "
+            "requires named provider credentials, a real destination table, a "
+            "caller-asserted expected_record_count checked against the actual "
+            "fetched count, and post-write readback evidence. No rows were "
+            "imported and no row count is reported.",
+            detail={
+                "mode": "APPROVAL_REQUIRED",
+                "verdict": "QUARANTINE",
+                "rows_inserted": 0,
+                "contract_ref": "FINANCE-TOOL-CONTRACTS.md 3.2 billing_import_ar_ledger",
             },
         )
-    except Exception as e:
-        return _err("billing_import_ar_ledger", e)
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("billing_import_ar_ledger", e)
 
 
-async def billing_run_dunning_batch(
-    *,
-    experiment_id: str | None = None,
-    overdue_invoices: list[dict[str, Any]] | None = None,
-    sequence_name: str | None = None,
-    cloud_hours: float | None = None,
-    hourly_rate: float | None = None,
-    expected_recovery_pct: float | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
+async def billing_deploy_plan_change(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE (contract 3.2). APPROVAL_REQUIRED — alters a price and can
+    issue an invoice."""
     try:
-        batch_id = experiment_id or f"dun_{uuid.uuid4().hex[:10]}"
-        args = {
-            "batch_id": batch_id,
-            "overdue_invoices_count": len(overdue_invoices) if overdue_invoices else None,
-            "sequence_name": sequence_name,
-            "cloud_hours": cloud_hours,
-            "hourly_rate": hourly_rate,
-            "expected_recovery_pct": expected_recovery_pct,
-        }
-        return _scaffold(
-            "billing_run_dunning_batch",
-            args,
-            extra={
-                "batch_id": batch_id,
-                "status": "scheduled",
-                "expected_recovery_pct": expected_recovery_pct,
-            },
-        )
-    except Exception as e:
-        return _err("billing_run_dunning_batch", e)
-
-
-async def billing_deploy_plan_change(
-    *,
-    channel: str | None = None,
-    spend: float | None = None,
-    risk_level: str | None = None,
-    customer_id: str | None = None,
-    new_plan: str | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    try:
-        args = {
-            "channel": channel,
-            "spend": spend,
-            "risk_level": risk_level,
-            "customer_id": customer_id,
-            "new_plan": new_plan,
-        }
-        return _scaffold(
+        return not_implemented(
             "billing_deploy_plan_change",
-            args,
-            extra={
-                "deploy_id": f"planchg_{uuid.uuid4().hex[:12]}",
-                "status": "pending_ap2_approval",
-                "note": "Stripe / Chargebee plan switch lands in Phase 9",
+            "Changing a customer's billing plan is not implemented. It requires a "
+            "named provider chosen before build (not at call time), an explicit "
+            "subscription_id, a current_plan_id optimistic-concurrency guard, "
+            "proration semantics verified against the provider's documented "
+            "behaviour, readback evidence and a per-call human authorization. "
+            "No subscription was modified.",
+            detail={
+                "mode": "APPROVAL_REQUIRED",
+                "verdict": "QUARANTINE",
+                "contract_ref": "FINANCE-TOOL-CONTRACTS.md 3.2 billing_deploy_plan_change",
             },
         )
-    except Exception as e:
-        return _err("billing_deploy_plan_change", e)
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("billing_deploy_plan_change", e)
 
 
 async def billing_generate_revops_report(
     *,
     subscriptions: list[dict[str, Any]] | None = None,
-    period: str = "current",
-    # legacy kwargs accepted but ignored
-    dashboards: int | None = None,
-    seat_cost: float | None = None,
+    currency: str | None = None,
+    period: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Generates a RevOps report computed from a provided list of subscription dicts."""
-    from datetime import datetime, timezone
-    from collections import defaultdict
+    """READ_ONLY RevOps summary computed from caller-supplied subscriptions.
 
+    Integer minor units throughout. Annualisation comes from an explicit
+    ``interval`` field, never from string-matching the plan name: the previous
+    heuristic silently divided "Enterprise Yearly Support (billed monthly)" by
+    twelve and left "Pro-12" undivided. Annual-to-monthly amortisation uses
+    largest-remainder allocation so twelve months sum exactly to the annual
+    amount.
+    """
+    tool = "billing_generate_revops_report"
     try:
+        violations: list[dict[str, Any]] = []
+        if not isinstance(subscriptions, list):
+            violations.append({"field": "subscriptions", "rule": "required_list", "received_type": type(subscriptions).__name__})
+        if not _valid_currency(currency):
+            violations.append({"field": "currency", "rule": "required_iso4217_uppercase_3", "received_type": type(currency).__name__})
+        if not isinstance(period, str) or not period:
+            violations.append({"field": "period", "rule": "required_non_empty_str", "received_type": type(period).__name__})
+        if violations:
+            return validation_failed(tool, violations)
+
         subs: list[dict[str, Any]] = subscriptions or []
+        for idx, sub in enumerate(subs):
+            if not isinstance(sub, dict):
+                violations.append({"field": f"subscriptions[{idx}]", "rule": "must_be_object", "received_type": type(sub).__name__})
+                continue
+            plan = sub.get("plan")
+            if not isinstance(plan, str) or not (1 <= len(plan) <= 128):
+                violations.append({"field": f"subscriptions[{idx}].plan", "rule": "str_1_128", "received_type": type(plan).__name__})
+            amt = sub.get("amount_minor")
+            if not _is_int(amt) or amt < 0:
+                violations.append({"field": f"subscriptions[{idx}].amount_minor", "rule": "int_minor_units_gte_0", "received_type": type(amt).__name__})
+            if sub.get("status") not in _SUB_STATUSES:
+                violations.append({"field": f"subscriptions[{idx}].status", "rule": f"enum_{sorted(_SUB_STATUSES)}", "received_type": type(sub.get("status")).__name__})
+            if sub.get("interval") not in _SUB_INTERVALS:
+                violations.append({"field": f"subscriptions[{idx}].interval", "rule": f"enum_{sorted(_SUB_INTERVALS)}", "received_type": type(sub.get("interval")).__name__})
+            sub_ccy = sub.get("currency")
+            if not _valid_currency(sub_ccy):
+                violations.append({"field": f"subscriptions[{idx}].currency", "rule": "required_iso4217_uppercase_3", "received_type": type(sub_ccy).__name__})
+            elif sub_ccy != currency:
+                violations.append({"field": f"subscriptions[{idx}].currency", "rule": "must_equal_report_currency", "received_type": "str"})
 
-        if not subs:
-            return {
-                "ok": True,
-                "report": {
-                    "period": period,
-                    "mrr": 0.0,
-                    "arr": 0.0,
-                    "active_subscriptions": 0,
-                    "trial_subscriptions": 0,
-                    "churned_subscriptions": 0,
-                    "churn_rate_pct": 0.0,
-                    "plan_breakdown": {},
-                    "arpa": 0.0,
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                    "note": "No subscription data was provided. Pass subscriptions=[...] for a real report.",
-                },
-            }
+        if violations:
+            return validation_failed(tool, violations)
 
-        mrr = 0.0
+        mrr_minor = 0
+        arr_minor = 0
         active_count = 0
         trial_count = 0
         churned_count = 0
-        plan_groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "mrr": 0.0})
+        plan_groups: dict[str, dict[str, int]] = defaultdict(lambda: {"count": 0, "mrr_minor": 0})
 
         for sub in subs:
-            status = str(sub.get("status", "active")).lower()
-            plan = str(sub.get("plan", "unknown"))
-            try:
-                amount = float(sub.get("amount", 0))
-            except (TypeError, ValueError):
-                amount = 0.0
-
-            # Normalise to monthly: heuristic — if amount looks like an annual figure
-            # (plan name contains "annual"/"yearly"/"year"), divide by 12.
-            plan_lower = plan.lower()
-            if any(k in plan_lower for k in ("annual", "yearly", "year")):
-                monthly_amount = amount / 12.0
+            plan = sub["plan"]
+            amount_minor = int(sub["amount_minor"])
+            if sub["interval"] == "year":
+                monthly_minor = _allocate(amount_minor, 12)[0]
+                annual_minor = amount_minor
             else:
-                monthly_amount = amount
+                monthly_minor = amount_minor
+                annual_minor = amount_minor * 12
 
             plan_groups[plan]["count"] += 1
-            if status == "active":
+            if sub["status"] == "active":
                 active_count += 1
-                mrr += monthly_amount
-                plan_groups[plan]["mrr"] = round(plan_groups[plan]["mrr"] + monthly_amount, 4)
-            elif status == "trial":
+                mrr_minor += monthly_minor
+                arr_minor += annual_minor
+                plan_groups[plan]["mrr_minor"] += monthly_minor
+            elif sub["status"] == "trial":
                 trial_count += 1
-                plan_groups[plan]["mrr"] = round(plan_groups[plan]["mrr"], 4)
-            elif status == "cancelled":
+            elif sub["status"] == "cancelled":
                 churned_count += 1
 
-        arr = mrr * 12.0
-        denominator = active_count + churned_count
-        churn_rate = (churned_count / denominator * 100.0) if denominator > 0 else 0.0
-        arpa = (mrr / active_count) if active_count > 0 else 0.0
-
-        # round plan breakdown
-        plan_breakdown = {
-            plan: {"count": v["count"], "mrr": round(v["mrr"], 2)}
-            for plan, v in plan_groups.items()
-        }
-
-        return {
-            "ok": True,
-            "report": {
-                "period": period,
-                "mrr": round(mrr, 2),
-                "arr": round(arr, 2),
-                "active_subscriptions": active_count,
-                "trial_subscriptions": trial_count,
-                "churned_subscriptions": churned_count,
-                "churn_rate_pct": round(churn_rate, 4),
-                "plan_breakdown": plan_breakdown,
-                "arpa": round(arpa, 2),
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+        report = {
+            "period": period,
+            "currency": currency,
+            "source": "caller_supplied",
+            "mrr_minor": mrr_minor,
+            "arr_minor": arr_minor,
+            "active_subscriptions": active_count,
+            "trial_subscriptions": trial_count,
+            "churned_subscriptions": churned_count,
+            "churn_rate_bp": _basis_points(churned_count, active_count + churned_count),
+            "plan_breakdown": {
+                plan: {"count": v["count"], "mrr_minor": v["mrr_minor"]}
+                for plan, v in sorted(plan_groups.items())
             },
+            "arpa_minor": _divide_half_even(mrr_minor, active_count),
+            "subscription_count": len(subs),
+            "generated_at": now_rfc3339(),
         }
-    except Exception as e:
-        return _err("billing_generate_revops_report", e)
+        checksum_body = {k: v for k, v in report.items() if k != "generated_at"}
+        report["result_checksum"] = sha256_hex(checksum_body)
 
-
-async def billing_run_billing_cycle(
-    *,
-    provider: str | None = None,
-    dataset_price: float | None = None,
-    records: int | None = None,
-    cloud_hours: float | None = None,
-    deployment_spend: float | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    try:
-        args = {
-            "provider": provider,
-            "dataset_price": dataset_price,
-            "records": records,
-            "cloud_hours": cloud_hours,
-            "deployment_spend": deployment_spend,
-        }
-        return _scaffold(
-            "billing_run_billing_cycle",
-            args,
-            extra={
-                "cycle_id": f"bcycle_{uuid.uuid4().hex[:12]}",
-                "stages": [
-                    "ar_imported",
-                    "dunning_run",
-                    "plan_change_deployed",
-                    "revops_report_generated",
-                ],
-                "status": "scaffold_complete",
-            },
+        return success(
+            tool=tool,
+            mode=MODE_READ_ONLY,
+            result={"report": report},
+            evidence=read_evidence(
+                source="caller_supplied",
+                query_fingerprint=sha256_hex(
+                    canonical_json({"subscriptions": subs, "currency": currency, "period": period})
+                ),
+                row_count=len(subs),
+                checksum=report["result_checksum"],
+            ),
         )
     except Exception as e:
-        return _err("billing_run_billing_cycle", e)
+        return from_exception(tool, e)
 
 
 async def billing_get_budget_metrics(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE. Previously returned an invented monthly_limit of 1500.00
+    under ok: true."""
     try:
-        return {
-            "ok": True,
-            "stub": True,
-            "action": "billing_get_budget_metrics",
-            "monthly_limit": 1500.00,
-            "monthly_spend": 0.00,
-            "remaining_budget": 1500.00,
-            "window": {"start": None, "end": None},
-            "note": "Phase 3 scaffold - real AP2 metrics in Phase 6",
-        }
-    except Exception as e:
-        return _err("billing_get_budget_metrics", e)
+        return provider_unconfigured(
+            "billing_get_budget_metrics",
+            _BUDGET_STORE_KEYS,
+            "No budget store is wired for the billing agent. Budget figures are "
+            "unavailable; none are invented. Absence of a limit is not headroom.",
+            detail={"mode": MODE_READ_ONLY, "verdict": "QUARANTINE"},
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("billing_get_budget_metrics", e)
 
 
 async def billing_get_audit_log(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE. An empty entries[] under ok: true reads as a clean audit log."""
     try:
-        return {
-            "ok": True,
-            "stub": True,
-            "action": "billing_get_audit_log",
-            "entries": [],
-            "count": 0,
-            "note": "Phase 3 scaffold - real AP2 audit log in Phase 6",
-        }
-    except Exception as e:
-        return _err("billing_get_audit_log", e)
+        return provider_unconfigured(
+            "billing_get_audit_log",
+            _BUDGET_STORE_KEYS,
+            "No audit store is wired for the billing agent. No entries can be "
+            "returned; an empty log must not be inferred.",
+            detail={"mode": MODE_READ_ONLY, "verdict": "QUARANTINE"},
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("billing_get_audit_log", e)
 
 
 async def billing_get_alerts(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE. An empty alerts[] under ok: true reads as 'nothing flagged'."""
     try:
-        return {
-            "ok": True,
-            "stub": True,
-            "action": "billing_get_alerts",
-            "alerts": [],
-            "count": 0,
-            "note": "Phase 3 scaffold - real alert engine in Phase 6",
-        }
-    except Exception as e:
-        return _err("billing_get_alerts", e)
+        return provider_unconfigured(
+            "billing_get_alerts",
+            _BUDGET_STORE_KEYS,
+            "No alert engine is wired for the billing agent. No alerts can be "
+            "returned; 'no alerts raised' must not be inferred.",
+            detail={"mode": MODE_READ_ONLY, "verdict": "QUARANTINE"},
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("billing_get_alerts", e)
 
 
 # ---------------------------------------------------------------------------
 # Schemas
+#
+# DELETED (PERMANENTLY_PROHIBITED, Section 6.1 Group A):
+#   billing_run_dunning_batch  (item 4) — charge retries against overdue invoices
+#   billing_run_billing_cycle  (item 5) — bundles dunning + plan change behind one approval
+# Do not reintroduce. runtime/tool_policy.assert_prohibitions_intact() makes
+# the process refuse to start if any of these names is registered again.
 # ---------------------------------------------------------------------------
 
 _SCHEMAS: dict[str, dict[str, Any]] = {
@@ -320,55 +310,26 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "billing_import_ar_ledger",
-            "description": "Import an AR/CRM dataset (subscriptions, open invoices) from Stripe/QuickBooks etc. Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "provider": {"type": "string"},
-                    "source": {"type": "string"},
-                    "price": {"type": "number"},
-                    "records": {"type": "integer"},
-                    "period": {"type": "string"},
-                },
-                "additionalProperties": True,
-            },
-        },
-    },
-    "billing_run_dunning_batch": {
-        "type": "function",
-        "function": {
-            "name": "billing_run_dunning_batch",
-            "description": "Run a dunning/retry cycle on overdue invoices. Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "experiment_id": {"type": "string"},
-                    "overdue_invoices": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
-                    "sequence_name": {"type": "string"},
-                    "cloud_hours": {"type": "number"},
-                    "hourly_rate": {"type": "number"},
-                    "expected_recovery_pct": {"type": "number"},
-                },
-                "additionalProperties": True,
-            },
+            "description": (
+                "NOT IMPLEMENTED. Importing an AR ledger is quarantined pending named "
+                "provider credentials, a real destination table and readback evidence. "
+                "Always returns ok=false with error.code=not_implemented and "
+                "rows_inserted 0."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
     "billing_deploy_plan_change": {
         "type": "function",
         "function": {
             "name": "billing_deploy_plan_change",
-            "description": "Deploy a billing-plan change to a channel (Stripe/Chargebee). Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "channel": {"type": "string"},
-                    "spend": {"type": "number"},
-                    "risk_level": {"type": "string"},
-                    "customer_id": {"type": "string"},
-                    "new_plan": {"type": "string"},
-                },
-                "additionalProperties": True,
-            },
+            "description": (
+                "NOT IMPLEMENTED. Changing a customer's billing plan alters a price and "
+                "can issue an invoice; it is quarantined pending a named provider, "
+                "verified proration semantics, readback evidence and per-call human "
+                "authorization. Always returns ok=false with error.code=not_implemented."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
     "billing_generate_revops_report": {
@@ -376,55 +337,35 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "function": {
             "name": "billing_generate_revops_report",
             "description": (
-                "Produce a real RevOps report from a list of subscriptions. "
-                "Computes MRR, ARR, active/trial/churned counts, churn_rate_pct, "
-                "plan_breakdown (count + MRR per plan), and ARPA. "
-                "Annual plans (name contains 'annual'/'yearly'/'year') are normalised to monthly. "
-                "Pass an empty or omitted subscriptions list to receive a zero-value template."
+                "Compute MRR, ARR, churn and ARPA from a caller-supplied subscription "
+                "list. All money is integer minor units (amount_minor); floats are "
+                "rejected. currency and period are mandatory. Annualisation uses the "
+                "explicit interval field ('month' or 'year'), never the plan name. "
+                "Returns ok=true with evidence marked unverified for caller-supplied "
+                "data — this is arithmetic, not reconciliation."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "subscriptions": {
                         "type": "array",
-                        "description": (
-                            "List of subscription objects. Each must have: "
-                            "plan (string), amount (number, monthly or annual), "
-                            "status ('active' | 'cancelled' | 'trial'), "
-                            "start_date (ISO string). end_date is optional."
-                        ),
+                        "description": "Subscription objects. An empty list is permitted but must be explicit.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "plan": {"type": "string"},
-                                "amount": {"type": "number"},
-                                "status": {"type": "string", "enum": ["active", "cancelled", "trial"]},
-                                "start_date": {"type": "string"},
-                                "end_date": {"type": "string"},
+                                "amount_minor": {"type": "integer", "description": "Unsigned integer in the currency's minor unit, for one interval."},
+                                "interval": {"type": "string", "enum": ["month", "year"]},
+                                "status": {"type": "string", "enum": ["active", "trial", "cancelled"]},
+                                "currency": {"type": "string", "description": "ISO-4217 uppercase; must equal the report currency."},
                             },
-                            "required": ["plan", "amount", "status", "start_date"],
+                            "required": ["plan", "amount_minor", "interval", "status", "currency"],
                         },
                     },
-                    "period": {"type": "string", "default": "current", "description": "Label for the report period."},
+                    "currency": {"type": "string", "description": "ISO-4217 uppercase 3 letters. Mandatory, no default."},
+                    "period": {"type": "string"},
                 },
-                "additionalProperties": True,
-            },
-        },
-    },
-    "billing_run_billing_cycle": {
-        "type": "function",
-        "function": {
-            "name": "billing_run_billing_cycle",
-            "description": "Full billing cycle: AR import + dunning + plan change + RevOps report. Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "provider": {"type": "string"},
-                    "dataset_price": {"type": "number"},
-                    "records": {"type": "integer"},
-                    "cloud_hours": {"type": "number"},
-                    "deployment_spend": {"type": "number"},
-                },
+                "required": ["subscriptions", "currency", "period"],
                 "additionalProperties": True,
             },
         },
@@ -433,7 +374,11 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "billing_get_budget_metrics",
-            "description": "Return monthly_limit, monthly_spend, remaining_budget, window. Phase 3 scaffold.",
+            "description": (
+                "Return the billing agent's budget window from the budget store. No "
+                "store is wired, so this always returns ok=false with "
+                "error.code=provider_unconfigured. It never invents a limit."
+            ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
@@ -441,7 +386,11 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "billing_get_audit_log",
-            "description": "Return signed AP2 audit receipts for billing operations. Phase 3 scaffold.",
+            "description": (
+                "Return billing audit entries from the audit store. No store is wired, "
+                "so this always returns ok=false with error.code=provider_unconfigured. "
+                "It never returns an empty log that could be read as 'clean'."
+            ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
@@ -449,7 +398,11 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "billing_get_alerts",
-            "description": "Return per-transaction alerts crossed this session. Phase 3 scaffold.",
+            "description": (
+                "Return billing alerts from the alert engine. None is wired, so this "
+                "always returns ok=false with error.code=provider_unconfigured. It "
+                "never returns an empty list that could be read as 'nothing flagged'."
+            ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
@@ -457,11 +410,12 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 def register() -> None:
+    # PERMANENTLY_PROHIBITED names are absent by construction. Adding a
+    # register_tool line for billing_run_dunning_batch or
+    # billing_run_billing_cycle will make the gateway refuse to boot.
     register_tool("billing_import_ar_ledger", billing_import_ar_ledger, _SCHEMAS["billing_import_ar_ledger"])
-    register_tool("billing_run_dunning_batch", billing_run_dunning_batch, _SCHEMAS["billing_run_dunning_batch"])
     register_tool("billing_deploy_plan_change", billing_deploy_plan_change, _SCHEMAS["billing_deploy_plan_change"])
     register_tool("billing_generate_revops_report", billing_generate_revops_report, _SCHEMAS["billing_generate_revops_report"])
-    register_tool("billing_run_billing_cycle", billing_run_billing_cycle, _SCHEMAS["billing_run_billing_cycle"])
     register_tool("billing_get_budget_metrics", billing_get_budget_metrics, _SCHEMAS["billing_get_budget_metrics"])
     register_tool("billing_get_audit_log", billing_get_audit_log, _SCHEMAS["billing_get_audit_log"])
     register_tool("billing_get_alerts", billing_get_alerts, _SCHEMAS["billing_get_alerts"])

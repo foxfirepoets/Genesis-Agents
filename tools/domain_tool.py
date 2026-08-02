@@ -1,45 +1,50 @@
-"""Genesis Domain tools - Phase 3 scaffolds + functional candidate generator.
+"""Genesis Domain tools.
 
-Wraps the operations advertised by skill_bundles/genesis-domain.json so the
-agent runtime can dispatch them without 500s. The candidate generator is
-fully functional; the availability check calls Name.com's REST API when
-NAMECOM_USERNAME + NAMECOM_TOKEN are present in env, otherwise returns a
-scaffold response. Registration, DNS, and AP2 mandate flows are scaffolds
-for Phase 9.
+Implements Sections 5 and 6 of docs/FINANCE-TOOL-CONTRACTS.md for the
+finance-adjacent subset of this module.
+
+What changed and why:
+
+  * Three functions are PERMANENTLY_PROHIBITED (Section 6.1 Group A, items
+    12-14) and are DELETED — bodies, schemas and register_tool lines:
+      domain_create_intent_mandate  (constructs a spend mandate)
+      domain_register               (buys a domain)
+      domain_select_and_register    (composite ending in a purchase)
+    Absence beats denial.
+  * ``domain_get_cost_summary`` previously returned total_monthly_cost 0.00,
+    total_domains 0 and threshold_exceeded false under ok: true — a fabricated
+    all-clear identical in shape to a genuine one. It now returns
+    provider_unconfigured.
+  * The candidate generator and the Name.com availability check are real and
+    keep working; they now carry Section 5.6 evidence and return
+    provider_unconfigured instead of a fake success when credentials are absent.
 """
 from __future__ import annotations
 
 import logging
 import os
-import uuid
 from typing import Any
 
 from . import register_tool
+from ._envelope import (
+    CODE_UPSTREAM_TIMEOUT,
+    MODE_READ_ONLY,
+    canonical_json,
+    failure,
+    from_exception,
+    not_implemented,
+    provider_unconfigured,
+    read_evidence,
+    sha256_hex,
+    success,
+    validation_failed,
+)
 
 log = logging.getLogger(__name__)
 
-
-def _scaffold(action: str, args: dict[str, Any], extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": True,
-        "stub": True,
-        "action": action,
-        "args": args,
-        "note": "Phase 3 scaffold - Phase 9 integrates real provider",
-    }
-    if extra:
-        payload.update(extra)
-    return payload
-
-
-def _err(action: str, exc: Exception) -> dict[str, Any]:
-    log.exception("domain tool %s failed", action)
-    return {
-        "ok": False,
-        "action": action,
-        "error": type(exc).__name__,
-        "message": str(exc),
-    }
+# Environment variable NAMES only — never values (Section 5.4).
+_NAMECOM_KEYS = ["NAMECOM_USERNAME", "NAMECOM_TOKEN"]
+_REGISTRY_STORE_KEYS = ["GENESIS_JOB_DATABASE_URL", "DATABASE_URL"]
 
 
 # ---------------------------------------------------------------------------
@@ -62,19 +67,19 @@ async def domain_generate_candidates(
     try:
         root_theme = (theme or business_name or "").strip().lower()
         if not root_theme:
-            return {
-                "ok": False,
-                "error": "missing_input",
-                "message": "Provide 'theme' or 'business_name'.",
-            }
+            return validation_failed(
+                "domain_generate_candidates",
+                [{"field": "theme", "rule": "theme_or_business_name_required", "received_type": type(theme).__name__}],
+                "Provide 'theme' or 'business_name'.",
+            )
         # Strip non-alphanumeric chars from the root.
         cleaned = "".join(ch for ch in root_theme if ch.isalnum())
         if not cleaned:
-            return {
-                "ok": False,
-                "error": "invalid_input",
-                "message": "Theme/business_name had no alphanumeric characters.",
-            }
+            return validation_failed(
+                "domain_generate_candidates",
+                [{"field": "theme", "rule": "must_contain_alphanumeric", "received_type": "str"}],
+                "Theme/business_name had no alphanumeric characters.",
+            )
 
         prefixes = ["", "get", "my", "the", "use"]
         suffixes = ["", "hq", "io", "app", "ai", "co"]
@@ -103,15 +108,21 @@ async def domain_generate_candidates(
                     })
         candidates.sort(key=lambda c: -c["score"])
         top = candidates[: max(1, int(count))]
-        return {
-            "ok": True,
-            "action": "domain_generate_candidates",
-            "theme": root_theme,
-            "count": len(top),
-            "candidates": top,
-        }
+        result = {"theme": root_theme, "count": len(top), "candidates": top}
+        return success(
+            tool="domain_generate_candidates",
+            mode=MODE_READ_ONLY,
+            result=result,
+            evidence=read_evidence(
+                # Deterministic local computation over the caller's input.
+                source="caller_supplied",
+                query_fingerprint=sha256_hex(canonical_json({"theme": root_theme, "count": int(count)})),
+                row_count=len(top),
+                checksum=sha256_hex(canonical_json(result)),
+            ),
+        )
     except Exception as e:
-        return _err("domain_generate_candidates", e)
+        return from_exception("domain_generate_candidates", e)
 
 
 async def domain_check_availability(
@@ -119,43 +130,49 @@ async def domain_check_availability(
     domains: list[str] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Check availability via Name.com if NAMECOM_USERNAME + NAMECOM_TOKEN are
-    set in env, else return a scaffold response.
+    """READ_ONLY batch availability lookup against Name.com v4.
+
+    Returns provider_unconfigured — not a fake success — when NAMECOM_USERNAME
+    or NAMECOM_TOKEN are absent. The previous body returned ok: true with a row
+    of nulls per domain, which a caller could not distinguish from a real
+    "no result" answer.
     """
+    tool = "domain_check_availability"
     try:
         domain_list = domains or []
-        if not domain_list:
-            return {
-                "ok": False,
-                "error": "missing_input",
-                "message": "Provide 'domains' (non-empty list of strings).",
-            }
+        if not isinstance(domain_list, list) or not domain_list:
+            return validation_failed(
+                tool,
+                [{"field": "domains", "rule": "required_non_empty_list_1_50", "received_type": type(domains).__name__}],
+                "Provide 'domains' (non-empty list of strings, 1-50 elements).",
+            )
+        if len(domain_list) > 50:
+            return validation_failed(
+                tool,
+                [{"field": "domains", "rule": "max_50_elements", "received_type": "list"}],
+            )
 
         username = os.getenv("NAMECOM_USERNAME")
         token = os.getenv("NAMECOM_TOKEN")
         if not (username and token):
-            return {
-                "ok": True,
-                "stub": True,
-                "action": "domain_check_availability",
-                "results": [
-                    {"domain": d, "available": None, "premium": None, "price_usd": None}
-                    for d in domain_list
-                ],
-                "note": (
-                    "NAMECOM credentials not configured - returning stub. "
-                    "Set NAMECOM_USERNAME and NAMECOM_TOKEN to enable real checks."
-                ),
-            }
+            return provider_unconfigured(
+                tool,
+                _NAMECOM_KEYS,
+                "Name.com credentials are not configured, so availability is unknown. "
+                "No availability result is invented.",
+                detail={"mode": MODE_READ_ONLY},
+            )
 
         try:
             import httpx  # type: ignore
         except Exception as imp_err:
-            return {
-                "ok": False,
-                "error": "httpx_not_installed",
-                "message": f"httpx import failed: {imp_err}",
-            }
+            return provider_unconfigured(
+                tool,
+                ["httpx"],
+                "The httpx HTTP client is not installed in this deployment, so the "
+                "Name.com lookup cannot be performed.",
+                detail={"mode": MODE_READ_ONLY, "exception_type": type(imp_err).__name__},
+            )
 
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -164,158 +181,95 @@ async def domain_check_availability(
                     auth=(username, token),
                     json={"domainNames": domain_list},
                 )
+                # A 2xx is the only success. The previous `status_code < 400`
+                # test conflated a 3xx with a completed lookup.
+                if resp.status_code not in (200, 201):
+                    return failure(
+                        tool=tool,
+                        code=CODE_UPSTREAM_TIMEOUT,
+                        message="Name.com did not return a usable availability response.",
+                        detail={"provider": "namecom", "status_code": resp.status_code, "state": "indeterminate"},
+                        retry_after_ms=2000,
+                    )
                 data = resp.json()
-                return {
-                    "ok": resp.status_code < 400,
-                    "action": "domain_check_availability",
-                    "status_code": resp.status_code,
-                    "results": data.get("results", []),
-                }
+                results = data.get("results")
+                if not isinstance(results, list):
+                    return failure(
+                        tool=tool,
+                        code=CODE_UPSTREAM_TIMEOUT,
+                        message="Name.com returned a malformed availability body.",
+                        detail={"provider": "namecom", "state": "indeterminate"},
+                        retry_after_ms=2000,
+                    )
+                return success(
+                    tool=tool,
+                    mode=MODE_READ_ONLY,
+                    result={"results": results, "count": len(results)},
+                    evidence=read_evidence(
+                        source="namecom",
+                        query_fingerprint=sha256_hex(canonical_json({"domainNames": sorted(domain_list)})),
+                        row_count=len(results),
+                        checksum=sha256_hex(canonical_json(results)),
+                        unverified=False,
+                    ),
+                )
         except Exception as e:
-            return {
-                "ok": False,
-                "action": "domain_check_availability",
-                "error": type(e).__name__,
-                "message": str(e),
-            }
+            return from_exception(
+                tool,
+                e,
+                message="The Name.com availability lookup did not complete.",
+                detail={"provider": "namecom", "state": "indeterminate"},
+            )
     except Exception as e:
-        return _err("domain_check_availability", e)
+        return from_exception(tool, e)
 
 
-async def domain_create_intent_mandate(
-    *,
-    user_id: str | None = None,
-    business_name: str | None = None,
-    business_type: str | None = None,
-    max_domains: int | None = None,
-    max_price_per_domain: float | None = None,
-    valid_for_hours: int | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# DELETED (PERMANENTLY_PROHIBITED, Section 6.1 Group A):
+#   domain_create_intent_mandate  (item 12) — constructs a spend mandate
+#   domain_register               (item 13) — buys a domain
+#   domain_select_and_register    (item 14) — composite ending in a purchase
+# Bodies, schemas and register_tool lines are gone. Do not reintroduce:
+# runtime/tool_policy.assert_prohibitions_intact() makes the process refuse to
+# start if any of these names is registered again.
+# ---------------------------------------------------------------------------
+
+
+async def domain_configure_dns(**kwargs: Any) -> dict[str, Any]:
+    """Not implemented. The previous body returned status "configured" under
+    ok: true having configured no DNS records at all."""
     try:
-        args = {
-            "user_id": user_id,
-            "business_name": business_name,
-            "business_type": business_type,
-            "max_domains": max_domains,
-            "max_price_per_domain": max_price_per_domain,
-            "valid_for_hours": valid_for_hours,
-        }
-        return _scaffold(
-            "domain_create_intent_mandate",
-            args,
-            extra={
-                "intent_mandate_id": f"intent_{uuid.uuid4().hex[:12]}",
-                "status": "pending_ap2_approval",
-            },
-        )
-    except Exception as e:
-        return _err("domain_create_intent_mandate", e)
-
-
-async def domain_register(
-    *,
-    domain: str | None = None,
-    buyer_consent_token: str | None = None,
-    years: int = 1,
-    privacy: bool = True,
-    auto_renew: bool = True,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    try:
-        args = {
-            "domain": domain,
-            "buyer_consent_token": buyer_consent_token,
-            "years": years,
-            "privacy": privacy,
-            "auto_renew": auto_renew,
-        }
-        return _scaffold(
-            "domain_register",
-            args,
-            extra={
-                "registration_id": f"reg_{uuid.uuid4().hex[:12]}",
-                "domain": domain,
-                "status": "pending_ap2_approval",
-            },
-        )
-    except Exception as e:
-        return _err("domain_register", e)
-
-
-async def domain_configure_dns(
-    *,
-    domain: str | None = None,
-    records: list[dict[str, Any]] | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    try:
-        args = {"domain": domain, "records": records}
-        return _scaffold(
+        return not_implemented(
             "domain_configure_dns",
-            args,
-            extra={
-                "config_id": f"dns_{uuid.uuid4().hex[:12]}",
-                "records_count": len(records or []),
-                "status": "configured",
-            },
+            "DNS configuration is not implemented. It requires a credentialed "
+            "registrar/DNS provider and post-write readback of the zone. No DNS "
+            "record was created or changed.",
+            detail={"mode": "APPROVAL_REQUIRED", "records_written": 0},
         )
-    except Exception as e:
-        return _err("domain_configure_dns", e)
-
-
-async def domain_select_and_register(
-    *,
-    business_name: str | None = None,
-    business_type: str | None = None,
-    user_id: str | None = None,
-    auto_register: bool = False,
-    configure_dns: bool = False,
-    max_cost: float | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    try:
-        args = {
-            "business_name": business_name,
-            "business_type": business_type,
-            "user_id": user_id,
-            "auto_register": auto_register,
-            "configure_dns": configure_dns,
-            "max_cost": max_cost,
-        }
-        return _scaffold(
-            "domain_select_and_register",
-            args,
-            extra={
-                "workflow_id": f"dwf_{uuid.uuid4().hex[:12]}",
-                "stages": [
-                    "candidates_generated",
-                    "availability_checked",
-                    "intent_mandate_created",
-                    "domain_registered",
-                    "dns_configured",
-                ],
-                "status": "scaffold_complete",
-            },
-        )
-    except Exception as e:
-        return _err("domain_select_and_register", e)
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("domain_configure_dns", e)
 
 
 async def domain_get_cost_summary(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE (contract 3.5).
+
+    Previously returned total_monthly_cost 0.00, total_domains 0,
+    threshold_exceeded false and registered_domains [] under ok: true — a
+    fabricated all-clear identical in shape to a genuine one. A caller could
+    not distinguish "no domains are costing anything" from "nothing was
+    checked". No registry store is wired, so the truthful answer is that the
+    figures are unavailable.
+    """
     try:
-        return {
-            "ok": True,
-            "stub": True,
-            "action": "domain_get_cost_summary",
-            "total_monthly_cost": 0.00,
-            "total_domains": 0,
-            "threshold_exceeded": False,
-            "registered_domains": [],
-            "note": "Phase 3 scaffold - real AP2 metrics in Phase 6",
-        }
-    except Exception as e:
-        return _err("domain_get_cost_summary", e)
+        return provider_unconfigured(
+            "domain_get_cost_summary",
+            _REGISTRY_STORE_KEYS,
+            "No domain registry store is wired. Domain cost figures are "
+            "unavailable; a zero cost and an empty domain list are not inferred.",
+            detail={"mode": MODE_READ_ONLY, "verdict": "QUARANTINE"},
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("domain_get_cost_summary", e)
 
 
 # ---------------------------------------------------------------------------
@@ -365,49 +319,11 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
-    "domain_create_intent_mandate": {
-        "type": "function",
-        "function": {
-            "name": "domain_create_intent_mandate",
-            "description": "Create an AP2 IntentMandate authorizing N domain purchases under $X. Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "user_id": {"type": "string"},
-                    "business_name": {"type": "string"},
-                    "business_type": {"type": "string"},
-                    "max_domains": {"type": "integer"},
-                    "max_price_per_domain": {"type": "number"},
-                    "valid_for_hours": {"type": "integer"},
-                },
-                "additionalProperties": True,
-            },
-        },
-    },
-    "domain_register": {
-        "type": "function",
-        "function": {
-            "name": "domain_register",
-            "description": "Register a specific domain via the registrar (AP2 cart-mandate-gated). Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "domain": {"type": "string"},
-                    "buyer_consent_token": {"type": "string"},
-                    "years": {"type": "integer", "default": 1},
-                    "privacy": {"type": "boolean", "default": True},
-                    "auto_renew": {"type": "boolean", "default": True},
-                },
-                "required": ["domain"],
-                "additionalProperties": True,
-            },
-        },
-    },
     "domain_configure_dns": {
         "type": "function",
         "function": {
             "name": "domain_configure_dns",
-            "description": "Write DNS records for a domain (e.g. GitHub Pages CNAME/A). Phase 3 scaffold.",
+            "description": "NOT IMPLEMENTED. Writing DNS records requires a credentialed registrar/DNS provider and zone readback. Always returns ok=false with error.code=not_implemented.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -422,33 +338,11 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
-    "domain_select_and_register": {
-        "type": "function",
-        "function": {
-            "name": "domain_select_and_register",
-            "description": (
-                "End-to-end workflow: generate candidates, check availability, create AP2 mandate, "
-                "register, and optionally configure DNS. Phase 3 scaffold."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "business_name": {"type": "string"},
-                    "business_type": {"type": "string"},
-                    "user_id": {"type": "string"},
-                    "auto_register": {"type": "boolean", "default": False},
-                    "configure_dns": {"type": "boolean", "default": False},
-                    "max_cost": {"type": "number"},
-                },
-                "additionalProperties": True,
-            },
-        },
-    },
     "domain_get_cost_summary": {
         "type": "function",
         "function": {
             "name": "domain_get_cost_summary",
-            "description": "Return total_monthly_cost, total_domains, threshold_exceeded, registered_domains. Phase 3 scaffold.",
+            "description": "Return domain cost totals from the registry store. No store is wired, so this always returns ok=false with error.code=provider_unconfigured. It never reports a zero cost or an empty domain list as fact.",
             "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
@@ -456,10 +350,10 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 def register() -> None:
+    # PERMANENTLY_PROHIBITED names are absent by construction. Adding a
+    # register_tool line for domain_create_intent_mandate, domain_register or
+    # domain_select_and_register will make the gateway refuse to boot.
     register_tool("domain_generate_candidates", domain_generate_candidates, _SCHEMAS["domain_generate_candidates"])
     register_tool("domain_check_availability", domain_check_availability, _SCHEMAS["domain_check_availability"])
-    register_tool("domain_create_intent_mandate", domain_create_intent_mandate, _SCHEMAS["domain_create_intent_mandate"])
-    register_tool("domain_register", domain_register, _SCHEMAS["domain_register"])
     register_tool("domain_configure_dns", domain_configure_dns, _SCHEMAS["domain_configure_dns"])
-    register_tool("domain_select_and_register", domain_select_and_register, _SCHEMAS["domain_select_and_register"])
     register_tool("domain_get_cost_summary", domain_get_cost_summary, _SCHEMAS["domain_get_cost_summary"])

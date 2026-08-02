@@ -1,387 +1,371 @@
-"""Genesis Finance tools - Phase 3 scaffolds.
+"""Genesis Finance tools.
 
-Wraps the operations advertised by skill_bundles/genesis-finance.json so the
-agent runtime can dispatch them without 500s. Real provider integration
-(payroll, AR/AP, bank feeds, AP2/x402) lands in Phase 9.
+Implements Sections 4, 5 and 6 of docs/FINANCE-TOOL-CONTRACTS.md.
+
+Governing rule (Section 0): automation may PREPARE, a human PAYS, automation
+RECORDS. No function in this module constructs or transmits a payment.
+
+What changed and why:
+
+  * ``finance_run_payroll_batch``, ``finance_process_vendor_invoice`` and
+    ``finance_run_finance_close`` are PERMANENTLY_PROHIBITED (Section 6.1
+    Group A, items 1-3). Bodies, schemas and register_tool lines are DELETED.
+    Absence beats denial: deleted code cannot be re-enabled by a config change.
+  * Every remaining action returns the Section 5 truthful-failure envelope.
+    ok: true is unreachable without evidence.
+  * ``finance_generate_finance_report`` is the one tool the contract says
+    IMPLEMENT. It now uses integer minor units throughout, an explicit
+    ``category`` field instead of the first word of the description, and a
+    mandatory explicit currency with mixed-currency rejection.
 """
 from __future__ import annotations
 
 import logging
-import uuid
+from collections import defaultdict
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any
 
 from . import register_tool
+from ._envelope import (
+    MODE_READ_ONLY,
+    canonical_json,
+    from_exception,
+    not_implemented,
+    now_rfc3339,
+    provider_unconfigured,
+    read_evidence,
+    sha256_hex,
+    success,
+    validation_failed,
+)
 
 log = logging.getLogger(__name__)
 
+# Environment variable NAMES only — never values (Section 5.4).
+_BUDGET_STORE_KEYS = ["GENESIS_JOB_DATABASE_URL", "DATABASE_URL"]
 
-def _scaffold(action: str, args: dict[str, Any], extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "ok": True,
-        "stub": True,
-        "action": action,
-        "args": args,
-        "note": "Phase 3 scaffold - Phase 9 integrates real provider",
-    }
-    if extra:
-        payload.update(extra)
-    return payload
+_TX_TYPES = frozenset({"income", "expense", "transfer"})
+_REPORT_SOURCES = frozenset({"caller_supplied", "xero_export"})
 
 
-def _err(action: str, exc: Exception) -> dict[str, Any]:
-    log.exception("finance tool %s failed", action)
-    return {
-        "ok": False,
-        "action": action,
-        "error": type(exc).__name__,
-        "message": str(exc),
-    }
+# ---------------------------------------------------------------------------
+# Validation helpers (Section 4 money representation rules)
+# ---------------------------------------------------------------------------
+
+def _is_int(value: Any) -> bool:
+    """True for a real integer. bool is a subclass of int and is not money."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_currency(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 3 and value.isalpha() and value.isupper()
+
+
+def _valid_period(value: Any) -> bool:
+    """YYYY-MM or YYYY-MM-DD/YYYY-MM-DD."""
+    if not isinstance(value, str):
+        return False
+    if len(value) == 7 and value[4] == "-" and value[:4].isdigit() and value[5:].isdigit():
+        return True
+    if len(value) == 21 and value[10] == "/":
+        return _valid_date(value[:10]) and _valid_date(value[11:])
+    return False
+
+
+def _valid_date(value: Any) -> bool:
+    """RFC3339 date prefix YYYY-MM-DD."""
+    if not isinstance(value, str) or len(value) < 10:
+        return False
+    head = value[:10]
+    return (
+        head[4] == "-"
+        and head[7] == "-"
+        and head[:4].isdigit()
+        and head[5:7].isdigit()
+        and head[8:10].isdigit()
+    )
+
+
+def _basis_points(numerator: int, denominator: int) -> int:
+    """Integer basis points, ROUND_HALF_EVEN. Never a rounded float percentage."""
+    if denominator == 0:
+        return 0
+    value = (Decimal(numerator) * Decimal(10000)) / Decimal(denominator)
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_EVEN))
 
 
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
-async def finance_run_payroll_batch(
-    *,
-    employees: list[dict[str, Any]] | None = None,
-    employee_count: int | None = None,
-    cost_per_employee: float | None = None,
-    period: str | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
+async def finance_sync_bank_fees(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE (contract 3.1). APPROVAL_REQUIRED — writes a journal entry to
+    the system of record and must reconcile to a named bank statement line.
+
+    Not implementable today: no Xero provider integration, no readback evidence
+    and no idempotency store. The previous body returned status "reconciled"
+    under ok: true having reconciled nothing.
+    """
     try:
-        count = employee_count if employee_count is not None else (len(employees) if employees else 0)
-        args = {
-            "employees": employees,
-            "employee_count": count,
-            "cost_per_employee": cost_per_employee,
-            "period": period,
-        }
-        return _scaffold(
-            "finance_run_payroll_batch",
-            args,
-            extra={
-                "batch_id": f"payroll_{uuid.uuid4().hex[:12]}",
-                "employee_count": count,
-                "status": "queued_pending_ap2_approval",
-            },
-        )
-    except Exception as e:
-        return _err("finance_run_payroll_batch", e)
-
-
-async def finance_process_vendor_invoice(
-    *,
-    invoice: dict[str, Any] | None = None,
-    vendor: str | None = None,
-    amount: float | None = None,
-    category: str | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    try:
-        args = {
-            "invoice": invoice,
-            "vendor": vendor or (invoice or {}).get("vendor"),
-            "amount": amount if amount is not None else (invoice or {}).get("amount"),
-            "category": category or (invoice or {}).get("category"),
-        }
-        return _scaffold(
-            "finance_process_vendor_invoice",
-            args,
-            extra={
-                "invoice_id": f"inv_{uuid.uuid4().hex[:12]}",
-                "status": "scheduled_pending_ap2_approval",
-            },
-        )
-    except Exception as e:
-        return _err("finance_process_vendor_invoice", e)
-
-
-async def finance_sync_bank_fees(
-    *,
-    account: str | None = None,
-    fee_amount: float | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    try:
-        args = {"account": account, "fee_amount": fee_amount}
-        return _scaffold(
+        return not_implemented(
             "finance_sync_bank_fees",
-            args,
-            extra={
-                "sync_id": f"banksync_{uuid.uuid4().hex[:12]}",
-                "status": "reconciled",
+            "Recording bank fees to the general ledger is not implemented. It "
+            "requires a credentialed Xero Accounting API integration "
+            "(ManualJournals + BankTransactions), a bank_statement_line_id to "
+            "reconcile against, post-write readback evidence and a live "
+            "idempotency store. No ledger entry was created.",
+            detail={
+                "mode": "APPROVAL_REQUIRED",
+                "verdict": "QUARANTINE",
+                "contract_ref": "FINANCE-TOOL-CONTRACTS.md 3.1 finance_sync_bank_fees",
             },
         )
-    except Exception as e:
-        return _err("finance_sync_bank_fees", e)
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("finance_sync_bank_fees", e)
 
 
 async def finance_generate_finance_report(
     *,
     transactions: list[dict[str, Any]] | None = None,
-    period: str = "current",
-    currency: str = "USD",
-    # legacy kwargs accepted but ignored
-    month: str | None = None,
-    format: str = "json",
-    tooling_cost: float | None = None,
+    currency: str | None = None,
+    period: str | None = None,
+    source: str | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Generates a P&L report from a provided list of transaction dicts."""
-    from datetime import datetime, timezone
-    from collections import defaultdict
+    """READ_ONLY P&L computed from caller-supplied transactions.
 
+    Integer minor units throughout (Section 4). No float arithmetic touches a
+    monetary value. Mixed currencies are rejected, never silently summed.
+    Expenses group by an explicit ``category`` field — the previous
+    ``description.split()[0]`` heuristic was not an accounting category.
+
+    Evidence declares ``unverified: true`` for caller-supplied data: this is
+    arithmetic, not reconciliation, and says so machine-readably.
+    """
+    tool = "finance_generate_finance_report"
     try:
+        violations: list[dict[str, Any]] = []
+
+        if not isinstance(transactions, list):
+            violations.append(
+                {"field": "transactions", "rule": "required_list", "received_type": type(transactions).__name__}
+            )
+        if not _valid_currency(currency):
+            violations.append(
+                {"field": "currency", "rule": "required_iso4217_uppercase_3", "received_type": type(currency).__name__}
+            )
+        if not _valid_period(period):
+            violations.append(
+                {"field": "period", "rule": "required_YYYY-MM_or_YYYY-MM-DD/YYYY-MM-DD", "received_type": type(period).__name__}
+            )
+        if source not in _REPORT_SOURCES:
+            violations.append(
+                {"field": "source", "rule": f"required_enum_{sorted(_REPORT_SOURCES)}", "received_type": type(source).__name__}
+            )
+        if violations:
+            return validation_failed(tool, violations)
+
         txs: list[dict[str, Any]] = transactions or []
+        for idx, tx in enumerate(txs):
+            if not isinstance(tx, dict):
+                violations.append({"field": f"transactions[{idx}]", "rule": "must_be_object", "received_type": type(tx).__name__})
+                continue
+            if not _valid_date(tx.get("date")):
+                violations.append({"field": f"transactions[{idx}].date", "rule": "rfc3339_date", "received_type": type(tx.get("date")).__name__})
+            desc = tx.get("description")
+            if not isinstance(desc, str) or not (1 <= len(desc) <= 255):
+                violations.append({"field": f"transactions[{idx}].description", "rule": "str_1_255", "received_type": type(desc).__name__})
+            amt = tx.get("amount_minor")
+            if not _is_int(amt) or amt < 0:
+                # Received value deliberately omitted: it is money.
+                violations.append({"field": f"transactions[{idx}].amount_minor", "rule": "int_minor_units_gte_0", "received_type": type(amt).__name__})
+            tx_type = tx.get("type")
+            if tx_type not in _TX_TYPES:
+                violations.append({"field": f"transactions[{idx}].type", "rule": f"enum_{sorted(_TX_TYPES)}", "received_type": type(tx_type).__name__})
+            tx_ccy = tx.get("currency")
+            if not _valid_currency(tx_ccy):
+                violations.append({"field": f"transactions[{idx}].currency", "rule": "required_iso4217_uppercase_3", "received_type": type(tx_ccy).__name__})
+            elif tx_ccy != currency:
+                # Section 4 rule 4: no cross-currency arithmetic without an
+                # explicit FX rate, date and source. Refuse rather than sum.
+                violations.append({"field": f"transactions[{idx}].currency", "rule": "must_equal_report_currency", "received_type": "str"})
+            if tx_type == "expense":
+                cat = tx.get("category")
+                if not isinstance(cat, str) or not (1 <= len(cat) <= 64):
+                    violations.append({"field": f"transactions[{idx}].category", "rule": "required_str_1_64_for_expense", "received_type": type(cat).__name__})
 
-        if not txs:
-            return {
-                "ok": True,
-                "report": {
-                    "period": period,
-                    "currency": currency,
-                    "total_income": 0.0,
-                    "total_expenses": 0.0,
-                    "net_profit": 0.0,
-                    "profit_margin_pct": 0.0,
-                    "expense_breakdown": {},
-                    "monthly_breakdown": [],
-                    "top_expenses": [],
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                    "transaction_count": 0,
-                    "note": "No transaction data was provided. Pass transactions=[...] for a real report.",
-                },
-            }
+        # Partial acceptance is forbidden: any bad element fails the whole call.
+        if violations:
+            return validation_failed(tool, violations)
 
-        total_income = 0.0
-        total_expenses = 0.0
-        expense_groups: dict[str, float] = defaultdict(float)
-        monthly_income: dict[str, float] = defaultdict(float)
-        monthly_expenses: dict[str, float] = defaultdict(float)
+        total_income_minor = 0
+        total_expenses_minor = 0
+        expense_by_category: dict[str, int] = defaultdict(int)
+        monthly_income: dict[str, int] = defaultdict(int)
+        monthly_expenses: dict[str, int] = defaultdict(int)
         expense_items: list[dict[str, Any]] = []
 
         for tx in txs:
-            tx_type = str(tx.get("type", "")).lower()
-            try:
-                amount = float(tx.get("amount", 0))
-            except (TypeError, ValueError):
-                amount = 0.0
+            amount_minor = int(tx["amount_minor"])
+            month_key = str(tx["date"])[:7]
+            if tx["type"] == "income":
+                total_income_minor += amount_minor
+                monthly_income[month_key] += amount_minor
+            elif tx["type"] == "expense":
+                total_expenses_minor += amount_minor
+                monthly_expenses[month_key] += amount_minor
+                expense_by_category[tx["category"]] += amount_minor
+                expense_items.append(
+                    {
+                        "description": tx["description"],
+                        "category": tx["category"],
+                        "amount_minor": amount_minor,
+                        "date": tx["date"],
+                    }
+                )
+            # transfers move money between own accounts: excluded from P&L.
 
-            # monthly bucketing
-            raw_date = tx.get("date", "")
-            try:
-                month_key = str(raw_date)[:7]  # "YYYY-MM"
-                if len(month_key) < 7:
-                    month_key = "unknown"
-            except Exception:
-                month_key = "unknown"
+        net_profit_minor = total_income_minor - total_expenses_minor
+        all_months = sorted(set(monthly_income) | set(monthly_expenses))
 
-            if tx_type == "income":
-                total_income += amount
-                monthly_income[month_key] += amount
-            elif tx_type == "expense":
-                total_expenses += amount
-                monthly_expenses[month_key] += amount
-                # group by first word of description
-                description = str(tx.get("description", "other"))
-                group = description.split()[0] if description.split() else "other"
-                expense_groups[group] += amount
-                expense_items.append({"description": description, "amount": amount, "date": raw_date})
-            # transfers are skipped from income/expense totals
-
-        net_profit = total_income - total_expenses
-        profit_margin = (net_profit / total_income * 100.0) if total_income > 0 else 0.0
-
-        # monthly breakdown: union of all months seen
-        all_months = sorted(set(list(monthly_income.keys()) + list(monthly_expenses.keys())))
-        monthly_breakdown = [
-            {
-                "month": m,
-                "income": round(monthly_income.get(m, 0.0), 2),
-                "expenses": round(monthly_expenses.get(m, 0.0), 2),
-                "net": round(monthly_income.get(m, 0.0) - monthly_expenses.get(m, 0.0), 2),
-            }
-            for m in all_months
-        ]
-
-        top_expenses = sorted(expense_items, key=lambda x: x["amount"], reverse=True)[:5]
-
-        return {
-            "ok": True,
-            "report": {
-                "period": period,
-                "currency": currency,
-                "total_income": round(total_income, 2),
-                "total_expenses": round(total_expenses, 2),
-                "net_profit": round(net_profit, 2),
-                "profit_margin_pct": round(profit_margin, 4),
-                "expense_breakdown": {k: round(v, 2) for k, v in expense_groups.items()},
-                "monthly_breakdown": monthly_breakdown,
-                "top_expenses": top_expenses,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "transaction_count": len(txs),
-            },
-        }
-    except Exception as e:
-        return _err("finance_generate_finance_report", e)
-
-
-async def finance_run_finance_close(
-    *,
-    employee_count: int | None = None,
-    cost_per_employee: float | None = None,
-    vendor_amount: float | None = None,
-    category: str | None = None,
-    bank_fee: float | None = None,
-    period: str | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
-    try:
-        args = {
-            "employee_count": employee_count,
-            "cost_per_employee": cost_per_employee,
-            "vendor_amount": vendor_amount,
-            "category": category,
-            "bank_fee": bank_fee,
+        report = {
             "period": period,
+            "currency": currency,
+            "source": source,
+            "total_income_minor": total_income_minor,
+            "total_expenses_minor": total_expenses_minor,
+            # Sign is meaningful on this field alone: a loss is negative.
+            "net_profit_minor": net_profit_minor,
+            "profit_margin_bp": _basis_points(net_profit_minor, total_income_minor),
+            "expense_breakdown_minor": dict(sorted(expense_by_category.items())),
+            "monthly_breakdown": [
+                {
+                    "month": m,
+                    "income_minor": monthly_income.get(m, 0),
+                    "expenses_minor": monthly_expenses.get(m, 0),
+                    "net_minor": monthly_income.get(m, 0) - monthly_expenses.get(m, 0),
+                }
+                for m in all_months
+            ],
+            "top_expenses": sorted(expense_items, key=lambda x: -x["amount_minor"])[:5],
+            "transaction_count": len(txs),
+            "generated_at": now_rfc3339(),
         }
-        return _scaffold(
-            "finance_run_finance_close",
-            args,
-            extra={
-                "close_id": f"close_{uuid.uuid4().hex[:12]}",
-                "stages": [
-                    "payroll_run",
-                    "vendor_invoices_processed",
-                    "bank_fees_synced",
-                    "finance_report_generated",
-                ],
-                "status": "scaffold_complete",
-            },
+
+        # Checksum excludes generated_at so a caller can detect real drift
+        # rather than clock movement.
+        checksum_body = {k: v for k, v in report.items() if k != "generated_at"}
+        report["result_checksum"] = sha256_hex(checksum_body)
+
+        return success(
+            tool=tool,
+            mode=MODE_READ_ONLY,
+            result={"report": report},
+            evidence=read_evidence(
+                source=source or "caller_supplied",
+                query_fingerprint=sha256_hex(
+                    canonical_json({"transactions": txs, "currency": currency, "period": period})
+                ),
+                row_count=len(txs),
+                checksum=report["result_checksum"],
+            ),
         )
     except Exception as e:
-        return _err("finance_run_finance_close", e)
+        return from_exception(tool, e)
 
 
-async def finance_import_x402_transactions(
-    *,
-    transactions: list[dict[str, Any]] | None = None,
-    **kwargs: Any,
-) -> dict[str, Any]:
+async def finance_import_x402_transactions(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE (contract 3.1). APPROVAL_REQUIRED — changes a financial record.
+
+    The previous body returned ``"imported": len(txs)`` having inserted nothing.
+    Section 5.5 rule 4 forbids deriving rows_affected from len(input): the count
+    must come from the system that performed the write.
+    """
     try:
-        txs = transactions or []
-        args = {"transactions_count": len(txs)}
-        return _scaffold(
+        return not_implemented(
             "finance_import_x402_transactions",
-            args,
-            extra={
-                "import_id": f"x402imp_{uuid.uuid4().hex[:12]}",
-                "imported": len(txs),
-                "status": "ingested",
+            "Importing x402 ledger entries is not implemented. It requires a real "
+            "ledger table with a unique index on (entity_id, external_txn_id), a "
+            "caller-supplied batch checksum the tool recomputes, and post-insert "
+            "readback evidence. No rows were inserted and no row count is reported.",
+            detail={
+                "mode": "APPROVAL_REQUIRED",
+                "verdict": "QUARANTINE",
+                "rows_inserted": 0,
+                "contract_ref": "FINANCE-TOOL-CONTRACTS.md 3.1 finance_import_x402_transactions",
             },
         )
-    except Exception as e:
-        return _err("finance_import_x402_transactions", e)
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("finance_import_x402_transactions", e)
 
 
 async def finance_get_budget_metrics(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE. Previously returned an invented monthly_limit of 15000.00
+    under ok: true. An accounting runtime reading that concludes headroom
+    exists. No budget store is wired."""
     try:
-        return {
-            "ok": True,
-            "stub": True,
-            "action": "finance_get_budget_metrics",
-            "monthly_limit": 15000.00,
-            "monthly_spend": 0.00,
-            "remaining_budget": 15000.00,
-            "window": {"start": None, "end": None},
-            "note": "Phase 3 scaffold - real AP2 metrics in Phase 6",
-        }
-    except Exception as e:
-        return _err("finance_get_budget_metrics", e)
+        return provider_unconfigured(
+            "finance_get_budget_metrics",
+            _BUDGET_STORE_KEYS,
+            "No budget store is wired for the finance agent. Budget figures are "
+            "unavailable; none are invented. Absence of a limit is not headroom.",
+            detail={"mode": MODE_READ_ONLY, "verdict": "QUARANTINE"},
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("finance_get_budget_metrics", e)
 
 
 async def finance_get_audit_log(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE. An empty entries[] under ok: true reads as a clean audit log."""
     try:
-        return {
-            "ok": True,
-            "stub": True,
-            "action": "finance_get_audit_log",
-            "entries": [],
-            "count": 0,
-            "note": "Phase 3 scaffold - real AP2 audit log in Phase 6",
-        }
-    except Exception as e:
-        return _err("finance_get_audit_log", e)
+        return provider_unconfigured(
+            "finance_get_audit_log",
+            _BUDGET_STORE_KEYS,
+            "No audit store is wired for the finance agent. No entries can be "
+            "returned; an empty log must not be inferred.",
+            detail={"mode": MODE_READ_ONLY, "verdict": "QUARANTINE"},
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("finance_get_audit_log", e)
 
 
 async def finance_get_alerts(**kwargs: Any) -> dict[str, Any]:
+    """QUARANTINE. An empty alerts[] under ok: true reads as 'nothing flagged'."""
     try:
-        return {
-            "ok": True,
-            "stub": True,
-            "action": "finance_get_alerts",
-            "alerts": [],
-            "count": 0,
-            "note": "Phase 3 scaffold - real alert engine in Phase 6",
-        }
-    except Exception as e:
-        return _err("finance_get_alerts", e)
+        return provider_unconfigured(
+            "finance_get_alerts",
+            _BUDGET_STORE_KEYS,
+            "No alert engine is wired for the finance agent. No alerts can be "
+            "returned; 'no alerts raised' must not be inferred.",
+            detail={"mode": MODE_READ_ONLY, "verdict": "QUARANTINE"},
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("finance_get_alerts", e)
 
 
 # ---------------------------------------------------------------------------
 # Schemas
+#
+# DELETED (PERMANENTLY_PROHIBITED, Section 6.1 Group A):
+#   finance_run_payroll_batch        (item 1)  — payroll disbursement
+#   finance_process_vendor_invoice   (item 2)  — scheduling a disbursement
+#   finance_run_finance_close        (item 3)  — composite whose first stage is payroll
+# Do not reintroduce. runtime/tool_policy.assert_prohibitions_intact() makes
+# the process refuse to start if any of these names is registered again.
 # ---------------------------------------------------------------------------
 
 _SCHEMAS: dict[str, dict[str, Any]] = {
-    "finance_run_payroll_batch": {
-        "type": "function",
-        "function": {
-            "name": "finance_run_payroll_batch",
-            "description": "Run a payroll batch (AP2-gated + x402 charged). Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "employees": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
-                    "employee_count": {"type": "integer"},
-                    "cost_per_employee": {"type": "number"},
-                    "period": {"type": "string"},
-                },
-                "additionalProperties": True,
-            },
-        },
-    },
-    "finance_process_vendor_invoice": {
-        "type": "function",
-        "function": {
-            "name": "finance_process_vendor_invoice",
-            "description": "Schedule a vendor invoice payment with category tagging (AP2-approved). Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "invoice": {"type": "object", "additionalProperties": True},
-                    "vendor": {"type": "string"},
-                    "amount": {"type": "number"},
-                    "category": {"type": "string"},
-                },
-                "additionalProperties": True,
-            },
-        },
-    },
     "finance_sync_bank_fees": {
         "type": "function",
         "function": {
             "name": "finance_sync_bank_fees",
-            "description": "Reconcile bank fees against an account (AP2-approved). Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "account": {"type": "string"},
-                    "fee_amount": {"type": "number"},
-                },
-                "additionalProperties": True,
-            },
+            "description": (
+                "NOT IMPLEMENTED. Recording bank fees to the general ledger is "
+                "quarantined pending a credentialed Xero integration, statement-line "
+                "reconciliation and readback evidence. Always returns ok=false with "
+                "error.code=not_implemented. No ledger entry is created."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
     "finance_generate_finance_report": {
@@ -389,54 +373,37 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "function": {
             "name": "finance_generate_finance_report",
             "description": (
-                "Generate a real P&L report from a list of transactions. "
-                "Computes total_income, total_expenses, net_profit, profit_margin, "
-                "expense_breakdown by description prefix, monthly_breakdown, and top 5 expenses. "
-                "Pass an empty or omitted transactions list to receive a zero-value template."
+                "Compute a P&L from a caller-supplied transaction list. All money is "
+                "integer minor units (amount_minor); floats are rejected. currency, "
+                "period and source are mandatory and have no defaults. Mixed "
+                "currencies are rejected, never summed. Expenses group by an explicit "
+                "category field. Returns ok=true with evidence marked unverified for "
+                "caller-supplied data — this is arithmetic, not reconciliation."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "transactions": {
                         "type": "array",
-                        "description": (
-                            "List of transaction objects. Each must have: "
-                            "date (ISO string), description (string), amount (number), "
-                            "type ('income' | 'expense' | 'transfer')."
-                        ),
+                        "description": "Transaction objects. An empty list is permitted but must be explicit.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "date": {"type": "string"},
-                                "description": {"type": "string"},
-                                "amount": {"type": "number"},
+                                "date": {"type": "string", "description": "RFC3339 date, YYYY-MM-DD prefix."},
+                                "description": {"type": "string", "description": "1-255 characters."},
+                                "amount_minor": {"type": "integer", "description": "Unsigned integer in the currency's minor unit."},
                                 "type": {"type": "string", "enum": ["income", "expense", "transfer"]},
+                                "currency": {"type": "string", "description": "ISO-4217 uppercase; must equal the report currency."},
+                                "category": {"type": "string", "description": "Accounting category. Required when type is 'expense'."},
                             },
-                            "required": ["date", "description", "amount", "type"],
+                            "required": ["date", "description", "amount_minor", "type", "currency"],
                         },
                     },
-                    "period": {"type": "string", "default": "current", "description": "Label for the report period."},
-                    "currency": {"type": "string", "default": "USD", "description": "ISO 4217 currency code."},
+                    "currency": {"type": "string", "description": "ISO-4217 uppercase 3 letters. Mandatory, no default."},
+                    "period": {"type": "string", "description": "YYYY-MM or YYYY-MM-DD/YYYY-MM-DD."},
+                    "source": {"type": "string", "enum": ["caller_supplied", "xero_export"]},
                 },
-                "additionalProperties": True,
-            },
-        },
-    },
-    "finance_run_finance_close": {
-        "type": "function",
-        "function": {
-            "name": "finance_run_finance_close",
-            "description": "Full monthly close: payroll + vendor + fees + report. Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "employee_count": {"type": "integer"},
-                    "cost_per_employee": {"type": "number"},
-                    "vendor_amount": {"type": "number"},
-                    "category": {"type": "string"},
-                    "bank_fee": {"type": "number"},
-                    "period": {"type": "string"},
-                },
+                "required": ["transactions", "currency", "period", "source"],
                 "additionalProperties": True,
             },
         },
@@ -445,21 +412,24 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "finance_import_x402_transactions",
-            "description": "Bulk-import x402 ledger entries into the finance audit trail. Phase 3 scaffold.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "transactions": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
-                },
-                "additionalProperties": True,
-            },
+            "description": (
+                "NOT IMPLEMENTED. Bulk-importing x402 ledger entries is quarantined "
+                "pending a real ledger table with a uniqueness index and post-insert "
+                "readback. Always returns ok=false with error.code=not_implemented "
+                "and rows_inserted 0. It never reports len(input) as a row count."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
     "finance_get_budget_metrics": {
         "type": "function",
         "function": {
             "name": "finance_get_budget_metrics",
-            "description": "Return monthly_limit, monthly_spend, remaining_budget, window. Phase 3 scaffold.",
+            "description": (
+                "Return the finance agent's budget window from the budget store. No "
+                "store is wired, so this always returns ok=false with "
+                "error.code=provider_unconfigured. It never invents a limit."
+            ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
@@ -467,7 +437,11 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "finance_get_audit_log",
-            "description": "Return signed finance audit log entries. Phase 3 scaffold.",
+            "description": (
+                "Return finance audit entries from the audit store. No store is wired, "
+                "so this always returns ok=false with error.code=provider_unconfigured. "
+                "It never returns an empty log that could be read as 'clean'."
+            ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
@@ -475,7 +449,11 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "finance_get_alerts",
-            "description": "Return per-transaction alerts crossed this session. Phase 3 scaffold.",
+            "description": (
+                "Return finance alerts from the alert engine. None is wired, so this "
+                "always returns ok=false with error.code=provider_unconfigured. It "
+                "never returns an empty list that could be read as 'nothing flagged'."
+            ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": True},
         },
     },
@@ -483,11 +461,12 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 def register() -> None:
-    register_tool("finance_run_payroll_batch", finance_run_payroll_batch, _SCHEMAS["finance_run_payroll_batch"])
-    register_tool("finance_process_vendor_invoice", finance_process_vendor_invoice, _SCHEMAS["finance_process_vendor_invoice"])
+    # PERMANENTLY_PROHIBITED names are absent by construction. Adding a
+    # register_tool line for finance_run_payroll_batch,
+    # finance_process_vendor_invoice or finance_run_finance_close will make the
+    # gateway refuse to boot.
     register_tool("finance_sync_bank_fees", finance_sync_bank_fees, _SCHEMAS["finance_sync_bank_fees"])
     register_tool("finance_generate_finance_report", finance_generate_finance_report, _SCHEMAS["finance_generate_finance_report"])
-    register_tool("finance_run_finance_close", finance_run_finance_close, _SCHEMAS["finance_run_finance_close"])
     register_tool("finance_import_x402_transactions", finance_import_x402_transactions, _SCHEMAS["finance_import_x402_transactions"])
     register_tool("finance_get_budget_metrics", finance_get_budget_metrics, _SCHEMAS["finance_get_budget_metrics"])
     register_tool("finance_get_audit_log", finance_get_audit_log, _SCHEMAS["finance_get_audit_log"])
