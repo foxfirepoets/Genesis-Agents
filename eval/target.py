@@ -73,6 +73,7 @@ from .genesis_client import (
     GenesisClient,
     MoneyDomainBlocked,
     Outcome,
+    UnknownSlug,
 )
 from .redaction import redact, redact_text
 from .traceable import traced_agent_run
@@ -178,6 +179,11 @@ async def arun_example(
         result = await traced_agent_run(client, **parsed)
     except MoneyDomainBlocked as exc:
         return _blocked_outputs(inputs, exc, "blocked_money_domain")
+    except UnknownSlug as exc:
+        # Not a 404 — the gateway would have answered with a generic persona
+        # and returned 200. Surfaced as a row-level error, not an exception, so
+        # one bad dataset row cannot kill the whole experiment.
+        return _blocked_outputs(inputs, exc, "unknown_slug")
 
     return result_to_outputs(result)
 

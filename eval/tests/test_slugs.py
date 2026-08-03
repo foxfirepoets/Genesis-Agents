@@ -9,9 +9,12 @@ import asyncio
 import pytest
 
 from eval.genesis_client import (
+    LIVE_SLUG_COUNT,
     LIVE_SLUGS,
     GenesisClient,
     MoneyDomainBlocked,
+    Outcome,
+    UnknownSlug,
     is_money_domain,
     resolve_live_slug,
 )
@@ -60,6 +63,68 @@ def test_unknown_slug_is_best_effort_and_marked_unverified():
     resolved, resolution = resolve_live_slug("totally-made-up-agent")
     assert resolved == "totally_made_up_agent"
     assert resolution == "unverified"
+
+
+def test_the_snapshot_pins_the_live_count():
+    assert len(LIVE_SLUGS) == LIVE_SLUG_COUNT == 57
+
+
+# ---------------------------------------------------------------------------
+# Strict slugs — the silent-success failure mode
+#
+# An unrecognised slug does NOT 404. main.py falls back to a generic persona
+# built from slug.title() and returns HTTP 200 with a bland answer. Scoring
+# that would be scoring a stub, so an unverified slug is refused up front.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "typo",
+    [
+        "genesis-reserch",          # transposed letters
+        "genesis_research_x420",    # wrong suffix
+        "genesis-research-agent",   # plausible but not served
+        "totally-made-up-agent",
+    ],
+)
+def test_unknown_slug_is_refused_before_any_request(typo):
+    transport = FakeTransport([ok_response("bland generic persona answer")])
+    client = GenesisClient(transport=transport, api_key="k", jitter=False)
+    with pytest.raises(UnknownSlug):
+        asyncio.run(client.run_agent(typo, "task"))
+    assert transport.run_call_count == 0, "a typo'd slug reached the gateway"
+
+
+def test_the_strict_check_is_what_catches_it_not_a_404():
+    """Proof the guard matters: with strict off, the gateway returns 200."""
+    transport = FakeTransport([ok_response("bland generic persona answer")])
+    client = GenesisClient(
+        transport=transport, api_key="k", jitter=False, strict_slugs=False
+    )
+    result = asyncio.run(client.run_agent("genesis-reserch", "task"))
+    assert result.outcome is Outcome.SUCCESS       # <- silently "fine"
+    assert result.http_status == 200
+    assert result.slug_resolution == "unverified"  # <- the only warning sign
+
+
+@pytest.mark.parametrize("slug", ["genesis-research", "unit-test-generator", "qa_agent"])
+def test_known_slugs_pass_the_strict_check(slug):
+    transport = FakeTransport([ok_response()])
+    client = GenesisClient(transport=transport, api_key="k", jitter=False)
+    result = asyncio.run(client.run_agent(slug, "task"))
+    assert result.outcome is Outcome.SUCCESS
+    assert result.slug_resolution in ("verified", "aliased")
+
+
+def test_target_reports_an_unknown_slug_instead_of_raising():
+    from eval.target import make_target
+
+    transport = FakeTransport([ok_response()])
+    target = make_target(GenesisClient(transport=transport, api_key="k", jitter=False))
+    outputs = target({"slug": "genesis-reserch", "task": "t"})
+    assert outputs["error_kind"] == "unknown_slug"
+    assert outputs["ok"] is False
+    assert transport.run_call_count == 0
 
 
 def test_known_slug_is_marked_verified_or_aliased():

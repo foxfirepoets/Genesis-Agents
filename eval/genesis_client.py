@@ -36,16 +36,28 @@ DEFAULT_MAX_ATTEMPTS = 3  # 1 initial attempt + at most 2 retries
 DEFAULT_BACKOFF_BASE_S = 0.5
 DEFAULT_BACKOFF_MAX_S = 8.0
 
-#: Live gateway slugs, snapshotted from an unauthenticated ``GET /agents``.
-#: Used only to resolve a hyphenated bundle slug to its live form; a slug that
-#: is absent is still sent (marked ``unverified``) rather than rejected.
+#: Live gateway slugs, snapshotted verbatim from an unauthenticated
+#: ``GET /agents`` on 2026-08-03. Independently confirmed identical to
+#: ``main.py::AGENT_PERSONAS`` (lines 354-719).
+#:
+#: This allowlist is a correctness control, not a convenience. A slug the
+#: gateway does not recognise does NOT 404 on ``/run``: ``run_agent()`` falls
+#: back to a generic persona built from ``slug.title()`` and returns HTTP 200
+#: with a bland answer. Only ``GET /capabilities`` 404s. So a typo'd slug
+#: silently produces a plausible-looking success that would quietly poison an
+#: evaluation. The allowlist is what catches that — see ``strict_slugs``.
+#:
+#: Keep in sync with the live service. ``tests/test_slugs.py`` pins the count
+#: and ``tests/test_live_catalogue.py`` fails loudly if live diverges.
 LIVE_SLUGS: frozenset[str] = frozenset(
     {
+        # x402 marketplace agents (15)
         "genesis_research_x402", "genesis_builder_x402", "genesis_deploy_x402",
         "genesis_content_x402", "genesis_email_x402", "genesis_commerce_x402",
         "genesis_qa_x402", "genesis_support_x402", "genesis_finance_x402",
         "genesis_security_x402", "genesis_billing_x402", "genesis_analyst_x402",
         "genesis_marketing_x402", "genesis_seo_x402", "genesis_meta_x402",
+        # core named agents (29)
         "genesis_meta_agent", "builder_agent", "builder_agent_enhanced",
         "deploy_agent", "qa_agent", "research_discovery_agent", "spec_agent",
         "security_agent", "maintenance_agent", "seo_agent", "content_agent",
@@ -54,10 +66,26 @@ LIVE_SLUGS: frozenset[str] = frozenset(
         "darwin_agent", "domain_name_agent", "legal_agent", "onboarding_agent",
         "reflection_agent", "waltzrl_conversation_agent",
         "waltzrl_feedback_agent", "se_darwin_agent", "ring1t_reasoning_agent",
-        "business_idea_generator", "genesis-ai-vision-api",
-        "genesis-workflow-automator", "genesis-data-pipeline-agent",
+        "business_idea_generator",
+        # hyphenated product agents (13)
+        "genesis-ai-vision-api", "genesis-workflow-automator",
+        "genesis-data-pipeline-agent", "unit-test-generator",
+        "api-documentation-generator", "social-media-scheduler",
+        "web-scraper-pro", "meeting-summarizer", "expense-tracker",
+        "review-responder", "onboarding-automation", "image-optimizer",
+        "backup-manager",
     }
 )
+
+#: Pinned size of :data:`LIVE_SLUGS`. Asserted at import and against the live
+#: service by the opt-in catalogue test.
+LIVE_SLUG_COUNT = 57
+
+if len(LIVE_SLUGS) != LIVE_SLUG_COUNT:  # pragma: no cover - import-time guard
+    raise RuntimeError(
+        f"LIVE_SLUGS holds {len(LIVE_SLUGS)} entries but LIVE_SLUG_COUNT is "
+        f"{LIVE_SLUG_COUNT}; re-derive the snapshot from GET /agents"
+    )
 
 #: Bundle-file slugs whose live counterpart does not follow the
 #: ``hyphen -> underscore + _x402`` rule. Inverse of
@@ -101,6 +129,16 @@ class Outcome(str, Enum):
 
 class MoneyDomainBlocked(RuntimeError):
     """Raised instead of invoking a finance/billing/commerce/pricing agent."""
+
+
+class UnknownSlug(RuntimeError):
+    """Raised instead of invoking a slug the live catalogue does not contain.
+
+    This exists because the failure mode is *silent success*, not a 404. The
+    gateway answers an unrecognised slug with a generic persona derived from
+    ``slug.title()`` and returns HTTP 200. Scoring that output would be scoring
+    a stub. Refusing up front is the only way to catch a typo'd slug.
+    """
 
 
 @dataclass(frozen=True)
@@ -321,6 +359,7 @@ class GenesisClient:
         transport: Transport | None = None,
         warmup: bool = True,
         allow_money_domain: bool = False,
+        strict_slugs: bool = True,
         api_key: str | None = None,
         gateway_secret: str | None = None,
         sleep: Any = None,
@@ -338,6 +377,7 @@ class GenesisClient:
         self.transport: Transport = transport or HttpxTransport()
         self.warmup = warmup
         self.allow_money_domain = allow_money_domain
+        self.strict_slugs = strict_slugs
         self._api_key_override = api_key
         self._gateway_secret_override = gateway_secret
         self._sleep = sleep or asyncio.sleep
@@ -432,6 +472,15 @@ class GenesisClient:
             raise MoneyDomainBlocked(
                 f"refusing to invoke money-domain agent {live_slug!r}; "
                 "pass allow_money_domain=True to override"
+            )
+        if resolution == "unverified" and self.strict_slugs:
+            # NOT a 404 risk — an unrecognised slug returns HTTP 200 from a
+            # generic persona. Refuse rather than score a stub.
+            raise UnknownSlug(
+                f"{slug!r} resolved to {live_slug!r}, which is not in the live "
+                f"catalogue of {LIVE_SLUG_COUNT} agents. The gateway would "
+                "answer it with a generic persona and return 200, so this is "
+                "refused. Pass strict_slugs=False to send it anyway."
             )
         if mode not in ("live_test", "full"):
             raise ValueError("mode must be 'live_test' or 'full'")

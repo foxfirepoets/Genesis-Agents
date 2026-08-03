@@ -70,9 +70,18 @@ python -m venv .venv
 ./.venv/Scripts/python.exe -m pytest eval/tests -q
 ```
 
-No test performs a network call. `GET /health` and `GET /agents` are
-unauthenticated and safe to hit manually; `POST /agents/{slug}/run` is never
-called by the suite.
+The suite is **hermetic by construction**. `tests/conftest.py` clears
+`LANGSMITH_API_KEY`, `LANGSMITH_ENDPOINT` and `LANGSMITH_PROJECT` and pins
+`LANGSMITH_TRACING=false` — both at conftest import time and again in a
+session-scoped autouse fixture — so no test can ship a run to the real
+LangSmith project no matter what `.env` or the shell holds. A second autouse
+fixture fails any test that enables tracing against a non-loopback endpoint.
+`tests/test_isolation.py` asserts the guard is in force.
+
+No test performs a network call by default. `POST /agents/{slug}/run` is never
+called by the suite. The one opt-in network test (`test_live_catalogue.py`,
+gated on `GENESIS_EVAL_LIVE_CHECK=1`) calls only the unauthenticated
+`GET /agents`.
 
 ## Use
 
@@ -133,12 +142,31 @@ Five, mutually exclusive, on `outputs["outcome"]`:
 | `success` | 2xx | n/a |
 | `auth_error` | 401 / 403 | never |
 | `not_found` | 404 — usually the wrong slug form | never |
-| `upstream_error` | definitively failed: 5xx after the attempt cap, connect failure, or any other 4xx (400/422/429). `http_status` + `error_kind` disambiguate. | 5xx and connect failures only |
+| `upstream_error` | definitively failed: 5xx after the attempt cap, connect failure, **or any other 4xx** | 5xx and connect failures only |
 | `indeterminate` | the request reached the wire and the outcome is **unknown** (read/write timeout after send) | never — a retry could double-invoke |
 
 **Rubrics must skip, not fail, an example where `determinate` is `False`.** An
 unknown outcome is not evidence the agent is bad, and treating it as a failure
 was a real defect on the Cato side.
+
+### Deliberate deviation: non-auth, non-404 4xx map to `upstream_error`
+
+There are five outcome classes, not six. A `400`, `422` or `429` lands in
+`upstream_error` rather than getting its own class, with `error_kind` set to
+`client_error_<status>`.
+
+**Rubric authors: do not treat every `upstream_error` as a retryable upstream
+failure.** Read `error_kind` to tell them apart:
+
+| `error_kind` | meaning | whose fault |
+| --- | --- | --- |
+| `server_error_5xx` | gateway or router failed after 3 attempts | the service |
+| `transport_connect` | never reached the server after 3 attempts | network / cold start |
+| `client_error_422` | the request body was rejected — **the dataset row is malformed** | the dataset |
+| `client_error_429` | rate limited — **not retried**, back off at the experiment level | the caller |
+
+A `client_error_*` will never succeed on retry. If one appears, fix the dataset
+row or the pacing; do not re-run the example expecting a different result.
 
 ## Operational notes
 
@@ -155,6 +183,19 @@ was a real defect on the Cato side.
   live gateway serves underscores with an `_x402` suffix
   (`genesis_research_x402`). The client resolves either form to the live one and
   reports which via `slug_resolution` (`verified` / `aliased` / `unverified`).
+- **An unknown slug does NOT 404 — it silently succeeds.** `main.py` falls back
+  to a generic persona built from `slug.title()` and returns HTTP 200 with a
+  bland answer; only `GET /capabilities` 404s. Scoring that would be scoring a
+  stub. So `GenesisClient` ships with `strict_slugs=True`: a slug outside the
+  57-agent live catalogue is refused before a request is built
+  (`UnknownSlug` → `error_kind: "unknown_slug"` at the target level). Pass
+  `strict_slugs=False` to send it anyway. `LIVE_SLUGS` is snapshotted from
+  `GET /agents`; `LIVE_SLUG_COUNT` pins it at 57 and is asserted at import.
+  Reconcile against live with:
+
+  ```bash
+  GENESIS_EVAL_LIVE_CHECK=1 ./.venv/Scripts/python.exe -m pytest eval/tests/test_live_catalogue.py -v
+  ```
 - **`live_test` vs `full` are different measurements.** `live_test` sets
   `mode: "live_test"` + `testContext: true`, which skips AgentRuntime (no
   ConduitBridge startup) and uses the fast persona LLM path — documented as

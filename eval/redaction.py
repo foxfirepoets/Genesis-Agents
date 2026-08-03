@@ -39,6 +39,10 @@ _SENSITIVE_KEY_PARTS = (
     "passphrase",
     "credential",
     "private_key",
+    # "privkey" has no underscore before "key", so the "_key" part above does
+    # NOT match GENESIS_GATEWAY_PRIVKEY_B64 (the gateway signing key).
+    "privkey",
+    "seckey",
     "client_secret",
     "session_key",
     "cookie",
@@ -83,6 +87,8 @@ SECRET_ENV_VARS = (
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "GENESIS_SESSION_VAULT_KEY",
+    "GENESIS_GATEWAY_PRIVKEY_B64",
+    "R2_API_TOKEN",
 )
 
 # Values registered here are stripped verbatim from every string. Populated

@@ -170,6 +170,10 @@ def test_redacts_by_key_at_any_depth():
         "client_secret", "AGENT_GATEWAY_SECRET", "GATEWAY_API_KEY",
         "password", "access_token", "cookie", "DATABASE_URL",
         "aws_secret_access_key", "AWS_ACCESS_KEY_ID",
+        # The gateway signing key. "privkey" has no underscore before "key",
+        # so the generic "_key" part does NOT catch it — it needs its own part.
+        "GENESIS_GATEWAY_PRIVKEY_B64", "privkey", "gateway_privkey",
+        "R2_API_TOKEN", "GENESIS_SESSION_VAULT_KEY",
     ],
 )
 def test_sensitive_keys_are_recognised(key):
