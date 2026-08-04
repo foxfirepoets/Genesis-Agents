@@ -77,7 +77,17 @@ SLUG_ALLOWED_RISKS: dict[str, frozenset[str]] = {
         }
     ),
     "genesis-research": frozenset({RISK_READ_ONLY, RISK_NETWORK}),
-    "genesis-finance": frozenset({RISK_READ_ONLY, RISK_NETWORK, RISK_PAYMENT}),
+    # RISK_PAYMENT removed here per FINANCE-TOOL-CONTRACTS.md Section 7 Phase
+    # 3 (exact prescribed text: "remove RISK_PAYMENT from genesis-finance,
+    # leaving it frozenset({RISK_READ_ONLY, RISK_NETWORK})") and Phase 5
+    # ("RISK_PAYMENT remains permanently unreachable"). The mismatch is
+    # corrected and payment enforcement is switched OFF, not on, in the same
+    # commit. Enforced by test_tool_policy_matrix.py and the boot assertion.
+    # finance_sync_bank_fees/finance_import_x402_transactions (RISK_PAYMENT in
+    # TOOL_RISK_BY_NAME) are consequently unreachable for every slug — no
+    # caller-visible behavior changes, since both already unconditionally
+    # return not_implemented (Section 5).
+    "genesis-finance": frozenset({RISK_READ_ONLY, RISK_NETWORK}),
     "genesis-deploy": frozenset(
         {
             RISK_READ_ONLY,
@@ -261,6 +271,23 @@ def assert_prohibitions_intact(registry: dict | None = None) -> None:
     if RISK_PROHIBITED in DEFAULT_ALLOWED_RISKS:
         raise RuntimeError("DEFAULT_ALLOWED_RISKS grants RISK_PROHIBITED")
 
+    # FINANCE-TOOL-CONTRACTS.md Section 7 Phase 5: RISK_PAYMENT remains
+    # permanently unreachable. Turning it on would require editing this
+    # assertion, the test_tool_policy_matrix.py fixture, and regenerating the
+    # manifest -- three visible changes across three files, each of which
+    # fails CI on its own. That is the intended cost.
+    payment_holders = sorted(
+        slug for slug, allowed in SLUG_ALLOWED_RISKS.items() if RISK_PAYMENT in allowed
+    )
+    if payment_holders:
+        raise RuntimeError(
+            f"RISK_PAYMENT is granted to {payment_holders}, but Section 7 Phase 5 "
+            "requires it to be permanently unreachable. See "
+            "docs/FINANCE-TOOL-CONTRACTS.md Section 7."
+        )
+    if RISK_PAYMENT in DEFAULT_ALLOWED_RISKS:
+        raise RuntimeError("DEFAULT_ALLOWED_RISKS grants RISK_PAYMENT")
+
 
 def get_tool_risk(tool_name: str) -> str:
     """Return the risk class for tool_name. Unknown tools return RISK_ADMIN (fail-closed)."""
@@ -395,12 +422,15 @@ TOOL_RISK_BY_NAME: dict[str, str] = {
 
 
 def get_tool_risk_by_name(tool_name: str) -> str:
-    """Section 7 Phase 1 shadow classification. NOT used for enforcement.
+    """Section 7 Phase 3: this IS the enforcement path now.
 
-    Unknown tools return RISK_ADMIN (fail-closed) — same default as
-    ``get_tool_risk``, so a newly-registered tool with no explicit entry here
-    shows up as a shadow-log anomaly rather than silently resolving to
-    anything permissive.
+    ``check_tool_policy``/``is_tool_allowed`` call this, not the legacy
+    ``get_tool_risk``/``TOOL_RISK``. ``get_tool_risk`` and ``TOOL_RISK`` are
+    kept only as the historical, bare-category-word table for reference and
+    for tests that pin the pre-Phase-3 shape; they no longer decide anything.
+
+    Unknown tools return RISK_ADMIN (fail-closed) — a newly-registered tool
+    with no explicit entry here is denied, not silently permissive.
     """
     if tool_name in PROHIBITED_TOOLS:
         return RISK_PROHIBITED
@@ -409,7 +439,7 @@ def get_tool_risk_by_name(tool_name: str) -> str:
 
 def is_tool_allowed(agent_slug: str, tool_name: str) -> bool:
     """Return True if agent_slug is permitted to call tool_name."""
-    risk = get_tool_risk(tool_name)
+    risk = get_tool_risk_by_name(tool_name)
     allowed = SLUG_ALLOWED_RISKS.get(agent_slug, DEFAULT_ALLOWED_RISKS)
     return risk in allowed
 
@@ -429,7 +459,10 @@ def check_tool_policy(agent_slug: str, tool_name: str) -> dict:
             "prohibition_group": prohibition_group(tool_name),
             "error": "tool_policy_denied",
         }
-    risk = get_tool_risk(tool_name)
+    # Section 7 Phase 3: enforcement now reads TOOL_RISK_BY_NAME (registered
+    # names, hand-written, no prefixes) instead of the legacy bare-word
+    # TOOL_RISK. See get_tool_risk_by_name's docstring.
+    risk = get_tool_risk_by_name(tool_name)
     allowed = SLUG_ALLOWED_RISKS.get(agent_slug, DEFAULT_ALLOWED_RISKS)
     ok = risk in allowed
     return {

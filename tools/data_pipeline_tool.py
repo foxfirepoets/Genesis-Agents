@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from . import register_tool
+from ._envelope import from_exception, not_implemented
 
 log = logging.getLogger(__name__)
 
@@ -35,18 +36,26 @@ async def data_s3_signed_url(
 async def data_bigquery_query(
     *, project_id: str, query: str, max_rows: int = 1000, **kwargs: Any
 ) -> dict[str, Any]:
+    """READ_ONLY per FINANCE-TOOL-CONTRACTS.md Section 8. No GCP integration is
+    wired, so this always returns ok=false with error.code=not_implemented —
+    never a fabricated result set. The previous body used the banned
+    ``scaffold`` key (Section 5.3 rule 3) instead of the taxonomy-coded
+    failure envelope; no result data ever changed.
+    """
     try:
-        return {
-            "ok": False,
-            "scaffold": True,
-            "tool": "data_bigquery_query",
-            "project_id": project_id,
-            "query": query,
-            "max_rows": max_rows,
-            "message": f"BigQuery integration deferred until GCP credentials wired ({_PHASE9_NOTE})",
-        }
-    except Exception as e:
-        return {"ok": False, "error": type(e).__name__, "message": str(e)}
+        return not_implemented(
+            "data_bigquery_query",
+            f"BigQuery integration deferred until GCP credentials wired ({_PHASE9_NOTE}). "
+            "No query was executed and no rows are returned.",
+            detail={
+                "mode": "READ_ONLY",
+                "project_id": project_id,
+                "query": query,
+                "max_rows": max_rows,
+            },
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        return from_exception("data_bigquery_query", e)
 
 
 async def data_dbt_compile(

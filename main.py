@@ -235,6 +235,10 @@ async def lifespan(app: FastAPI):
 
     assert_escrow_containment()
 
+    # docs/FINANCE-TOOL-CONTRACTS.md Section 7 "Related precondition".
+    assert_gateway_key_configured()
+    logger.info("gateway auth guard: GATEWAY_API_KEY is configured")
+
     cache_dir = os.path.expanduser("~/.cache/ms-playwright")
     has_browser = os.path.isdir(cache_dir) and any(True for _ in os.scandir(cache_dir))
     if not has_browser:
@@ -306,12 +310,15 @@ async def verify_gateway_key(
     2. X-Agent-Gateway-Secret — internal shared secret sent by swarmsync-api's executeAgent()
        service when calling our own gateway. Checked against AGENT_GATEWAY_SECRET env var.
 
-    If GATEWAY_API_KEY is not set, the check is skipped (dev/backward-compat mode).
+    The lifespan startup guard (Section 7 of FINANCE-TOOL-CONTRACTS.md) now
+    refuses to boot this process at all when GATEWAY_API_KEY is unset, so the
+    fallback below is unreachable in a running instance — kept only as a
+    defense-in-depth no-op for direct unit-level calls to this dependency.
     Either valid credential is sufficient; both may be provided.
     """
     expected_api_key = os.getenv("GATEWAY_API_KEY")
     if not expected_api_key:
-        # Dev mode — open to all callers
+        # Unreachable when the process actually booted; see lifespan() above.
         return
 
     # Accept if X-Agent-Api-Key matches (constant-time comparison prevents timing oracle)
@@ -324,6 +331,26 @@ async def verify_gateway_key(
         return
 
     raise HTTPException(status_code=401, detail="Invalid or missing X-Agent-Api-Key")
+
+
+def assert_gateway_key_configured() -> None:
+    """docs/FINANCE-TOOL-CONTRACTS.md Section 7 "Related precondition".
+
+    Called from lifespan() before the app accepts traffic, deliberately not
+    wrapped in try/except (fail-to-boot beats fail-to-deny) — matching
+    assert_prohibitions_intact() and assert_escrow_containment() above it in
+    the startup sequence. Without GATEWAY_API_KEY, verify_gateway_key() above
+    accepts every caller as authenticated, and Cato's authorization model
+    assumes the gateway is authenticated — a fail-open front door makes every
+    downstream policy/ledger/approval control merely advisory.
+    """
+    if not os.getenv("GATEWAY_API_KEY"):
+        raise RuntimeError(
+            "GATEWAY_API_KEY is not set. Refusing to start: without it, "
+            "/agents/{slug}/run and /a2a accept every caller as authenticated "
+            "(see verify_gateway_key above). Set GATEWAY_API_KEY before "
+            "starting this service."
+        )
 
 
 _DEFAULT_ADMIN_EMAILS = "bullrushinvestments@gmail.com"

@@ -270,18 +270,20 @@ class TestPolicyDenial:
             assert RISK_PROHIBITED not in allowed, slug
         assert RISK_PROHIBITED not in DEFAULT_ALLOWED_RISKS
 
-    def test_risk_payment_appears_in_no_allowed_set_is_documented_as_pending(self):
-        """Section 7 Phase 5 makes RISK_PAYMENT permanently unreachable.
+    def test_risk_payment_appears_in_no_allowed_set(self):
+        """Section 7 Phase 3/5 landed: RISK_PAYMENT was removed from
+        genesis-finance in the same commit that switched check_tool_policy to
+        TOOL_RISK_BY_NAME, and is now permanently unreachable (enforced again,
+        redundantly, by assert_prohibitions_intact()). Every payment-capable
+        tool is additionally prohibited by name, which is the stronger control
+        regardless of this one.
 
-        That is a tool_policy re-enablement change and is deliberately OUT OF
-        SCOPE here, so this test records the current state rather than asserting
-        the end state. Every payment-capable tool is already prohibited by name,
-        which is the stronger control.
+        If this test ever fails, a slug was granted RISK_PAYMENT again --
+        re-read docs/FINANCE-TOOL-CONTRACTS.md Section 7 before touching it.
         """
-        holders = [s for s, a in SLUG_ALLOWED_RISKS.items() if RISK_PAYMENT in a]
-        assert holders == ["genesis-finance"], (
-            "If this changed, re-read Section 7 Phase 5 before touching it."
-        )
+        holders = sorted(s for s, a in SLUG_ALLOWED_RISKS.items() if RISK_PAYMENT in a)
+        assert holders == [], f"RISK_PAYMENT must be granted to no slug, found: {holders}"
+        assert RISK_PAYMENT not in DEFAULT_ALLOWED_RISKS
 
 
 # ---------------------------------------------------------------------------

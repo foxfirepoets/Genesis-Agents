@@ -72,21 +72,14 @@ class TestToolRiskByNameCoverage:
         for name in PROHIBITED_TOOLS:
             assert get_tool_risk_by_name(name) == RISK_PROHIBITED
 
-    def test_shadow_table_does_not_change_legacy_enforcement(self):
-        """Phase 1 is observability-only. check_tool_policy must be
-        untouched: every existing test_tool_policy.py assertion about legacy
-        behavior must still hold after this table exists."""
+    def test_previously_unchanged_pairs_still_resolve_the_same_way(self):
+        """These four pairs resolve identically under TOOL_RISK_BY_NAME and
+        the legacy TOOL_RISK — they were never part of the mismatch bug, and
+        Section 7 Phase 3 (which switched check_tool_policy over to this
+        table, see runtime/tool_policy.py and test_tool_policy_matrix.py)
+        must not have disturbed them."""
         from runtime.tool_policy import check_tool_policy
 
-        # Same fixtures test_tool_policy.py already pins as legacy behavior.
         assert check_tool_policy("genesis-meta", "genesis_call")["ok"] is True
         assert check_tool_policy("genesis-finance", "workspace_shell")["ok"] is False
         assert check_tool_policy("genesis-builder", "file_write")["ok"] is True
-        # A tool this Phase-1 table newly classifies READ_ONLY must still be
-        # denied under the legacy path for a slug that never had it granted —
-        # proving the shadow table has zero effect on real enforcement today.
-        result = check_tool_policy("genesis-billing", "billing_generate_revops_report")
-        assert result["ok"] is False, (
-            "legacy enforcement must be unchanged by the Phase 1 shadow "
-            f"table — genesis-billing must still be denied. Got: {result}"
-        )
