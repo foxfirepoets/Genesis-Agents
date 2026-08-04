@@ -1,0 +1,39 @@
+{
+  "session_id": "2026-08-04T13:32:00Z-ws4z85",
+  "started_at": "2026-08-04T13:32:00Z",
+  "updated_at": "2026-08-04T14:10:00Z",
+  "pipeline_mode": "LOOP_ONLY",
+  "upstream_phases": {
+    "o2o_mapping": "SKIPPED",
+    "spec_generation": "SKIPPED",
+    "workspace_scaffold": "SKIPPED",
+    "ralph_planning": "SKIPPED"
+  },
+  "o2o_map_path": null,
+  "spec_path": null,
+  "tasks": [
+    { "task_name": "FINANCE-TOOL-CONTRACTS Section 7 Phase 1: TOOL_RISK_BY_NAME shadow mode (no enforcement change)", "phase": "PENDING", "ralph_iterations": 1, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": "First attempt wrote the forbidden Section-7 fix directly (compound names added to TOOL_RISK + SLUG_ALLOWED_RISKS in one commit); caught by tests/test_prohibited_tools.py's RISK_PAYMENT tripwire before commit, reverted via git checkout, task re-scoped in IMPLEMENTATION_PLAN.md to Phase 1 (shadow-mode only) per the doc's own staged plan.", "completed_at": null, "escalation_reason": null },
+    { "task_name": "FINANCE-TOOL-CONTRACTS Section 7 Phase 3: envelope adoption + switch enforcement + matrix gating test + GATEWAY_API_KEY hard-fail", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Resolve 4 orphaned skill bundles (maintenance/onboarding/domain/pricing)", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Resolve onboarding_agent vs genesis-onboarding.json slug collision", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Add server-side deployment-domain enforcement for genesis_deploy_x402", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Remove duplicate tool registrations (vercel_deploy/netlify_deploy/github_tool)", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Fix marketing-agent fabrication defect + permanent regression test", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Build docs/validation/agent-inventory.json generator", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Add async job-polling support for the 5 job_mode:async agents", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Build deterministic-evaluators module", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Build docs/validation/capability-test-matrix.json generator", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Run full 30-category suite for the 20 skill-bundle agents (3 reps)", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Run applicable-category suite for the 36 persona-only agents (3 reps)", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Run guarded-path tests for deploy/finance/billing/commerce agents (5 reps)", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Run security/injection/exfiltration cross-cutting pass across all 57 agents", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Build+run tool-level suite for the 9 dispatchable tools", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Resolve remaining registered-but-undispatchable tools (run_code/send_email/github_tool/screenshot_url/hr_template_generate/vision_*)", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null },
+    { "task_name": "Generate coverage-report.json + known-limitations.json", "phase": "PENDING", "ralph_iterations": 0, "tfl_cycles": 0, "verdict": "NOT_RUN", "commit_sha": null, "validation_evidence": null, "completed_at": null, "escalation_reason": null }
+  ],
+  "current_task_idx": 0,
+  "current_phase": "RALPH",
+  "owner_blocked": false,
+  "owner_gated_items": [],
+  "all_complete": false
+}
