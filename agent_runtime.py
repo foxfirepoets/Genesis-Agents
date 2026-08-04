@@ -47,7 +47,10 @@ except Exception:
 # ImportError is not a prohibition. runtime.tool_policy is pure standard
 # library, so this import cannot fail anywhere agent_runtime itself imports.
 from runtime.tool_policy import (  # noqa: E402
+    DEFAULT_ALLOWED_RISKS,
+    SLUG_ALLOWED_RISKS,
     assert_prohibitions_intact,
+    get_tool_risk_by_name,
     is_prohibited,
     prohibition_group,
 )
@@ -555,6 +558,21 @@ class AgentRuntime:
                 else:
                     # Phase 8: policy check before execution
                     _policy = check_tool_policy(slug, fn_name)
+                    # FINANCE-TOOL-CONTRACTS.md Section 7 Phase 1 — shadow-mode
+                    # comparison only. Does not affect _policy or tool_result
+                    # below in any way; enforcement stays on check_tool_policy/
+                    # legacy TOOL_RISK until Section 7 Phase 3 lands.
+                    _shadow_new_risk = get_tool_risk_by_name(fn_name)
+                    emit_event(job_id, "tool.policy.shadow", {
+                        "tool_name": fn_name,
+                        "agent_slug": slug,
+                        "legacy_risk": _policy.get("risk_class"),
+                        "new_risk": _shadow_new_risk,
+                        "would_allow_legacy": _policy["ok"],
+                        "would_allow_new": _shadow_new_risk
+                        in SLUG_ALLOWED_RISKS.get(slug, DEFAULT_ALLOWED_RISKS),
+                        "session_id": session_id,
+                    })
                     if not _policy["ok"]:
                         emit_event(job_id, "tool.blocked", {
                             "tool_name": fn_name,

@@ -269,6 +269,144 @@ def get_tool_risk(tool_name: str) -> str:
     return TOOL_RISK.get(tool_name, RISK_ADMIN)
 
 
+# ---------------------------------------------------------------------------
+# docs/FINANCE-TOOL-CONTRACTS.md Section 7 Phase 1 — shadow-mode remediation
+# of the TOOL_RISK compound-name mismatch (TOOL_RISK above is keyed on bare
+# category words; agent_runtime.py dispatches by full registered name, so
+# every one of these fell through to RISK_ADMIN and 17 of 24 skill-bundle
+# agents could execute zero of their advertised tools).
+#
+# Section 7 explicitly forbids fixing this by mapping names to risk classes
+# by category-word prefix, or by adding them to TOOL_RISK directly in one
+# commit: either would flip ~55 tools from denied to allowed simultaneously,
+# and prefix-mapping would additionally resolve pricing_purchase_dataset (a
+# money-spending tool) to read_only, exposing it to every agent slug
+# including the DEFAULT_ALLOWED_RISKS fallback.
+#
+# This table is Phase 1 only: it is hand-written per registered name (no
+# prefixes, no defaults), and it is NOT wired into check_tool_policy/
+# is_tool_allowed below — enforcement stays on the legacy TOOL_RISK path.
+# agent_runtime.py logs a shadow comparison (legacy vs. new, would-allow
+# under each) on every dispatch so the delta is observable before Phase 3
+# ever flips enforcement over. See docs/FINANCE-TOOL-CONTRACTS.md Section 7
+# for the full 5-phase plan and its preconditions.
+TOOL_RISK_BY_NAME: dict[str, str] = {
+    # Already correctly resolving today (bare word == registered name) —
+    # included so this table is complete over the live registry, not just
+    # over the names that were broken.
+    "file_write": RISK_FILESYSTEM_WRITE,
+    "code_format": RISK_READ_ONLY,
+    "genesis_call": RISK_SUBAGENT,
+    "conduit": RISK_BROWSER,
+    "workspace_shell": RISK_SHELL,
+    "web_search": RISK_NETWORK,
+    "web_fetch": RISK_NETWORK,
+    "vercel_deploy": RISK_DEPLOYMENT,
+    "netlify_deploy": RISK_DEPLOYMENT,
+
+    # finance_tool.py — APPROVAL_REQUIRED (mode per FINANCE-TOOL-CONTRACTS.md
+    # Section 8): mutates a real financial record. Classified RISK_PAYMENT so
+    # a future Phase 4 grant is visible and deliberate, never inherited from a
+    # broader network/read_only widening.
+    "finance_sync_bank_fees": RISK_PAYMENT,
+    "finance_import_x402_transactions": RISK_PAYMENT,
+    # READ_ONLY mode — reports computed from caller data, no mutation.
+    "finance_generate_finance_report": RISK_READ_ONLY,
+    "finance_get_budget_metrics": RISK_READ_ONLY,
+    "finance_get_audit_log": RISK_READ_ONLY,
+    "finance_get_alerts": RISK_READ_ONLY,
+
+    # billing_tool.py
+    "billing_import_ar_ledger": RISK_PAYMENT,          # APPROVAL_REQUIRED
+    "billing_deploy_plan_change": RISK_PAYMENT,         # APPROVAL_REQUIRED
+    "billing_generate_revops_report": RISK_READ_ONLY,   # READ_ONLY
+    "billing_get_budget_metrics": RISK_READ_ONLY,
+    "billing_get_audit_log": RISK_READ_ONLY,
+    "billing_get_alerts": RISK_READ_ONLY,
+
+    # commerce_tool.py
+    "commerce_configure_tax_engine": RISK_PAYMENT,      # APPROVAL_REQUIRED
+    "commerce_get_budget_metrics": RISK_READ_ONLY,
+    "commerce_get_audit_log": RISK_READ_ONLY,
+    "commerce_get_alerts": RISK_READ_ONLY,
+
+    # pricing_tool.py — the two mutation tools are APPROVAL_REQUIRED per
+    # Section 8, deliberately NOT the bare "pricing" -> RISK_READ_ONLY above
+    # (Disagreement 6: that bare mapping is itself wrong, independent of the
+    # keying bug, because it would expose a money-spending action as
+    # read_only under a naive prefix fix).
+    "pricing_run_elasticity_experiment": RISK_PAYMENT,
+    "pricing_deploy_pricing_update": RISK_PAYMENT,
+    "pricing_get_budget_metrics": RISK_READ_ONLY,
+    "pricing_get_audit_log": RISK_READ_ONLY,
+    "pricing_get_alerts": RISK_READ_ONLY,
+
+    # domain_tool.py — finance-adjacent subset. domain_check_availability and
+    # domain_get_cost_summary are READ_ONLY per Section 8; domain_generate_
+    # candidates and domain_configure_dns are explicitly excluded from the
+    # financial contract (cannot move money, alter a price, issue an invoice,
+    # or change a financial record) and get an ordinary technical risk class.
+    "domain_check_availability": RISK_READ_ONLY,
+    "domain_get_cost_summary": RISK_READ_ONLY,
+    "domain_generate_candidates": RISK_READ_ONLY,
+    "domain_configure_dns": RISK_DEPLOYMENT,
+
+    # workflow_tool.py — PROPOSE_ONLY (generates an export/config artifact for
+    # human review; no live effect) for the export tools. workflow_webhook_
+    # trigger is Group A (see PROHIBITION_GROUPS above) and slug-scoped
+    # prohibited for finance/billing/commerce/pricing; for every other slug
+    # it is a real outbound HTTP call, classified on that technical basis.
+    "workflow_zapier_export": RISK_FILESYSTEM_WRITE,
+    "workflow_n8n_export": RISK_FILESYSTEM_WRITE,
+    "workflow_make_export": RISK_FILESYSTEM_WRITE,
+    "workflow_webhook_trigger": RISK_NETWORK,
+
+    # data_pipeline_tool.py — finance-adjacent subset. data_s3_signed_url is
+    # APPROVAL_REQUIRED (a signed URL can read or write financial data at
+    # rest); data_bigquery_query is READ_ONLY; data_dbt_compile is
+    # PROPOSE_ONLY (compiles a model, does not run it); data_pipeline_design
+    # and data_quality_check are excluded from the financial contract.
+    "data_s3_signed_url": RISK_PAYMENT,
+    "data_bigquery_query": RISK_READ_ONLY,
+    "data_dbt_compile": RISK_FILESYSTEM_WRITE,
+    "data_pipeline_design": RISK_FILESYSTEM_WRITE,
+    "data_quality_check": RISK_READ_ONLY,
+
+    # Outside FINANCE-TOOL-CONTRACTS.md's scope entirely (not finance-
+    # adjacent) — classified on ordinary technical risk. github_tool pushes
+    # code/PRs (deployment-class); run_code executes in the sandbox_tool
+    # (shell-class); send_email/screenshot_url/vision_*/hr_*_query are
+    # outbound network calls; hr_template_generate writes a local file.
+    # send_email in particular is correctly classified here but is NOT
+    # granted to any slug in SLUG_ALLOWED_RISKS below — see
+    # IMPLEMENTATION_PLAN.md's "registered-but-undispatchable tools" task.
+    "github_tool": RISK_DEPLOYMENT,
+    "run_code": RISK_SHELL,
+    "send_email": RISK_NETWORK,
+    "screenshot_url": RISK_NETWORK,
+    "vision_analyze": RISK_NETWORK,
+    "vision_ocr": RISK_NETWORK,
+    "vision_compare": RISK_NETWORK,
+    "hr_bamboohr_query": RISK_NETWORK,
+    "hr_greenhouse_query": RISK_NETWORK,
+    "hr_lever_query": RISK_NETWORK,
+    "hr_template_generate": RISK_FILESYSTEM_WRITE,
+}
+
+
+def get_tool_risk_by_name(tool_name: str) -> str:
+    """Section 7 Phase 1 shadow classification. NOT used for enforcement.
+
+    Unknown tools return RISK_ADMIN (fail-closed) — same default as
+    ``get_tool_risk``, so a newly-registered tool with no explicit entry here
+    shows up as a shadow-log anomaly rather than silently resolving to
+    anything permissive.
+    """
+    if tool_name in PROHIBITED_TOOLS:
+        return RISK_PROHIBITED
+    return TOOL_RISK_BY_NAME.get(tool_name, RISK_ADMIN)
+
+
 def is_tool_allowed(agent_slug: str, tool_name: str) -> bool:
     """Return True if agent_slug is permitted to call tool_name."""
     risk = get_tool_risk(tool_name)
