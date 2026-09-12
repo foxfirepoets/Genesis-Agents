@@ -124,9 +124,9 @@ except Exception:  # pragma: no cover - ultra-defensive
 # transmit funds movements with no per-call human authorization anywhere in the
 # path. escrow_guard.escrow_permitted() is the single choke point: it returns
 # True only under an explicit GENESIS_DEPLOYMENT_PROFILE=swarmsync-marketplace.
-# Unset, or the Cato-facing profile, leaves _ESCROW_OK False, which makes every
-# escrow call site below unreachable — the same code path the gateway already
-# takes for free-tier (Cato) callers, so nothing new can break.
+# Unset, or enterprise-restricted profiles, leaves _ESCROW_OK False, which makes 
+# every escrow call site below unreachable — the same code path the gateway 
+# already takes for free-tier callers, so nothing new can break.
 from escrow_guard import escrow_permitted as _escrow_permitted
 
 if not _escrow_permitted():
@@ -305,7 +305,7 @@ async def verify_gateway_key(
 ) -> None:
     """Dependency: validates caller identity against two secrets:
 
-    1. X-Agent-Api-Key     — public API key for Cato, external tools, Render free-tier callers.
+    1. X-Agent-Api-Key     — public API key for external tools, integrations, and API callers.
        Checked against GATEWAY_API_KEY env var.
     2. X-Agent-Gateway-Secret — internal shared secret sent by swarmsync-api's executeAgent()
        service when calling our own gateway. Checked against AGENT_GATEWAY_SECRET env var.
@@ -340,7 +340,7 @@ def assert_gateway_key_configured() -> None:
     wrapped in try/except (fail-to-boot beats fail-to-deny) — matching
     assert_prohibitions_intact() and assert_escrow_containment() above it in
     the startup sequence. Without GATEWAY_API_KEY, verify_gateway_key() above
-    accepts every caller as authenticated, and Cato's authorization model
+    accepts every caller as authenticated, and the authorization model
     assumes the gateway is authenticated — a fail-open front door makes every
     downstream policy/ledger/approval control merely advisory.
     """
@@ -1799,7 +1799,7 @@ async def run_agent(slug: str, body: RunRequest):
 
                 # Phase 6 — if buyer + price are supplied, escrow funds before
                 # we hand the job to the worker. Agent wallet comes from the
-                # bundle (`wallet_id`). Free-tier (Cato) callers omit these.
+                # bundle (`wallet_id`). Free-tier callers omit these.
                 price_tier_cents = async_params.get("price_tier_cents") or bundle.get("price_tier_default_cents")
                 buyer_wallet_id = async_params.get("buyer_wallet_id")
                 agent_wallet_id = bundle.get("wallet_id")
@@ -1892,7 +1892,7 @@ async def run_agent(slug: str, body: RunRequest):
 
                 # Phase 6 — escrow buyer funds before sync execution if a
                 # buyer wallet + price are supplied AND the bundle declares
-                # an agent wallet. Free-tier callers (Cato) skip this.
+                # an agent wallet. Free-tier callers skip this.
                 sync_price_cents = params.get("price_tier_cents") if isinstance(params, dict) else None
                 sync_buyer_wallet = params.get("buyer_wallet_id") if isinstance(params, dict) else None
                 sync_agent_wallet = bundle.get("wallet_id")
