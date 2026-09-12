@@ -1,11 +1,11 @@
 """CI gate for escrow containment.
 
-docs/FINANCE-TOOL-CONTRACTS.md Sections 3.8 and 6.3.
+Reference: docs/legacy-deployments/FINANCE-TOOL-CONTRACTS-E4L.md (enterprise deployment example)
 
 escrow_client.py is not dormant: eleven live call sites, one of which settles
 escrow on job success with no human in the loop. These tests prove the
-containment is fail-closed by default and that the Cato-facing build refuses to
-start if the module is still shipped.
+containment is fail-closed by default and that enterprise-restricted builds 
+refuse to start if the module is still shipped.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import escrow_guard  # noqa: E402
 from escrow_guard import (  # noqa: E402
     ESCROW_FUNCTIONS,
-    PROFILE_CATO,
+    PROFILE_ENTERPRISE,
     PROFILE_ENV_VAR,
     PROFILE_MARKETPLACE,
     assert_escrow_containment,
@@ -45,7 +45,7 @@ class TestFailClosedDefault:
 
     @pytest.mark.parametrize(
         "value",
-        ["", "cato", "CATO", "e4l", "production", "true", "1", "swarmsync", "marketplace"],
+        ["", "enterprise", "ENTERPRISE", "e4l", "production", "true", "1", "swarmsync", "marketplace"],
     )
     def test_only_the_exact_marketplace_profile_permits_escrow(self, monkeypatch, value):
         monkeypatch.setenv(PROFILE_ENV_VAR, value)
@@ -56,28 +56,28 @@ class TestFailClosedDefault:
         assert escrow_permitted() is True
 
 
-class TestCatoFacingBuildRefusesToStart:
-    def test_negative_control_cato_build_with_escrow_client_present_raises(self, monkeypatch):
+class TestEnterpriseRestrictedBuildRefusesToStart:
+    def test_negative_control_enterprise_build_with_escrow_client_present_raises(self, monkeypatch):
         """NEGATIVE CONTROL.
 
-        escrow_client.py IS present in this repo, so declaring the Cato-facing
+        escrow_client.py IS present in this repo, so declaring the enterprise-restricted
         profile must make the boot assertion raise. If this test ever passes
         silently, the assertion is decorative.
         """
-        monkeypatch.setenv(PROFILE_ENV_VAR, PROFILE_CATO)
+        monkeypatch.setenv(PROFILE_ENV_VAR, PROFILE_ENTERPRISE)
         assert importlib.util.find_spec("escrow_client") is not None, (
             "precondition: escrow_client.py is present in this repo"
         )
-        with pytest.raises(RuntimeError, match="escrow_client is importable in a Cato-facing build"):
+        with pytest.raises(RuntimeError, match="escrow_client is importable in an enterprise-restricted build"):
             assert_escrow_containment()
 
-    def test_cato_build_passes_once_escrow_client_is_absent(self, monkeypatch):
-        """The Cato-facing artefact must not ship escrow_client.py at all.
+    def test_enterprise_build_passes_once_escrow_client_is_absent(self, monkeypatch):
+        """Enterprise-restricted builds must not ship escrow_client.py at all.
 
         Simulated by making the module unfindable, which is what removing it
         from the deployment artefact achieves.
         """
-        monkeypatch.setenv(PROFILE_ENV_VAR, PROFILE_CATO)
+        monkeypatch.setenv(PROFILE_ENV_VAR, PROFILE_ENTERPRISE)
         monkeypatch.setattr(escrow_guard, "escrow_client_importable", lambda: False)
         assert_escrow_containment()  # must not raise
 
